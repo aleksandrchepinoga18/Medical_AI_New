@@ -1,0 +1,33 @@
+# Явно подключается вторым -f; базовый compose остаётся без bind mounts.
+services:
+  backend:
+    build: {target: development}
+    command: [uvicorn, app.main:app, --host, 0.0.0.0, --port, "8000", --reload]
+    volumes:
+      - ../backend/app:/app/app
+      - ../backend/tests:/app/tests:ro
+  worker:
+    build: {target: development}
+    volumes:
+      - ../backend/app:/app/app:ro
+  frontend:
+    image: ${COMPOSE_PROJECT_NAME:-medical-ai}-frontend:development
+    build: {target: development}
+    command: [npm, run, dev]
+    environment:
+      NODE_ENV: development
+      HOSTNAME: 0.0.0.0
+      PORT: "3000"
+    volumes:
+      # Keep image dependencies and the writable build cache outside host mounts.
+      - ../frontend/app:/app/app
+      - ../frontend/tests:/app/tests:ro
+      - ../frontend/next.config.ts:/app/next.config.ts:ro
+      - ../frontend/tsconfig.json:/app/tsconfig.json
+      - ../frontend/next-env.d.ts:/app/next-env.d.ts
+      - ../frontend/eslint.config.mjs:/app/eslint.config.mjs:ro
+
+# Legacy volumes are retained but no longer mounted by frontend.
+volumes:
+  frontend-node-modules:
+  frontend-next:

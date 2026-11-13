@@ -1,0 +1,47 @@
+# Основа production-конфигурации; требования к TLS/auth/backup см. OPERATIONS.md.
+x-production: &production
+  logging:
+    driver: json-file
+    options: {max-size: 10m, max-file: "3"}
+  init: true
+
+services:
+  backend:
+    <<: *production
+    build: {target: runtime}
+    environment: {APP_ENV: production}
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+  worker:
+    <<: *production
+    build: {target: runtime}
+    environment: {APP_ENV: production}
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+  frontend:
+    <<: *production
+    image: ${COMPOSE_PROJECT_NAME:-medical-ai}-frontend:runtime
+    build: {target: runtime}
+    command: [node, server.js]
+    environment:
+      NODE_ENV: production
+      HOSTNAME: 0.0.0.0
+      PORT: "3000"
+    # Clear source/cache mounts even if the dev override was also supplied.
+    volumes: !reset []
+    cap_drop: [ALL]
+  mlflow:
+    <<: *production
+    cap_drop: [ALL]
+  postgres:
+    <<: *production
+  mlflow-db:
+    <<: *production
+  minio:
+    <<: *production
+  redis:
+    <<: *production
+  qdrant:
+    <<: *production

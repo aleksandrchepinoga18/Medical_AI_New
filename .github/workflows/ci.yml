@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          if [ -f requirements-dev.lock ]; then
+            python -m pip install --require-hashes -r requirements-dev.lock
+            python -m pip install --no-deps .
+          else
+            python -m pip install '.[dev]'
+          fi
+      - name: Lint
+        run: python -m ruff check .
+      - name: Format
+        run: python -m ruff format --check .
+      - name: Typecheck
+        run: python -m mypy app
+      - name: Unit tests
+        run: python -m pytest --junitxml=junit.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-test-results
+          path: backend/junit.xml
+          if-no-files-found: ignore
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.21.1"
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install --package-lock=false; fi
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit tests
+        run: npm test -- --reporter=default --reporter=junit --outputFile=junit.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frontend-test-results
+          path: frontend/junit.xml
+          if-no-files-found: ignore
+
+  docker-build:
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: backend, dockerfile: infrastructure/docker/backend.Dockerfile}
+          - {name: frontend, dockerfile: infrastructure/docker/frontend.Dockerfile}
+          - {name: mlflow, dockerfile: infrastructure/docker/mlflow.Dockerfile}
+          - {name: minio, dockerfile: infrastructure/docker/minio.Dockerfile, target: server}
+          - {name: minio-client, dockerfile: infrastructure/docker/minio.Dockerfile, target: client}
+          - {name: qdrant, dockerfile: infrastructure/docker/qdrant.Dockerfile}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          push: false
+          tags: medical-ai/${{ matrix.name }}:ci
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  compose-config:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate development topology without starting services
+        run: docker compose --env-file .env.example -f infrastructure/compose.yaml -f infrastructure/compose.dev.yaml config --quiet
+      - name: Validate production topology without starting services
+        run: docker compose --env-file .env.example -f infrastructure/compose.yaml -f infrastructure/compose.production.yaml config --quiet

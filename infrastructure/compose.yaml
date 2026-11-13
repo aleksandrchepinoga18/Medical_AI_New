@@ -1,0 +1,215 @@
+name: ${COMPOSE_PROJECT_NAME:-medical-ai}
+
+x-health: &health
+  interval: 15s
+  timeout: 5s
+  retries: 5
+  start_period: 30s
+
+x-app-environment: &app-environment
+  APP_ENV: ${APP_ENV:-development}
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+  MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+  MLFLOW_REGISTRY_URI: ${MLFLOW_REGISTRY_URI:-http://mlflow:5000}
+  MLFLOW_EXPERIMENT_NAME: ${MLFLOW_EXPERIMENT_NAME:-medical-ai-development}
+  MLFLOW_TRACING_ENABLED: ${MLFLOW_TRACING_ENABLED:-false}
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: infrastructure/docker/backend.Dockerfile
+      target: runtime
+    environment: *app-environment
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    networks: [web, app-db, objects, queue, vectors, tracking]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      minio-init: {condition: service_completed_successfully}
+      qdrant: {condition: service_healthy}
+    healthcheck:
+      <<: *health
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3)"]
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+
+  frontend:
+    image: ${COMPOSE_PROJECT_NAME:-medical-ai}-frontend:runtime
+    build:
+      context: ..
+      dockerfile: infrastructure/docker/frontend.Dockerfile
+      target: runtime
+    environment:
+      NEXT_TELEMETRY_DISABLED: "1"
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
+    networks: [web]
+    depends_on:
+      backend: {condition: service_healthy}
+    healthcheck:
+      <<: *health
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/health/live').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+
+  worker:
+    build:
+      context: ..
+      dockerfile: infrastructure/docker/backend.Dockerfile
+      target: runtime
+    command: [celery, -A, app.workers.celery_app:celery_app, worker, --loglevel=WARNING, --concurrency=2]
+    environment: *app-environment
+    networks: [app-db, objects, queue, vectors, tracking]
+    depends_on:
+      redis: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+      minio-init: {condition: service_completed_successfully}
+      qdrant: {condition: service_healthy}
+    healthcheck:
+      <<: *health
+      timeout: 15s
+      test: [CMD-SHELL, 'celery -A app.workers.celery_app:celery_app inspect ping --destination "celery@$$HOSTNAME" --timeout 8 >/dev/null 2>&1']
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+
+  postgres:
+    image: postgres:17.6-bookworm
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-medical_ai}
+      POSTGRES_USER: ${POSTGRES_USER:-medical_ai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    networks: [app-db]
+    healthcheck:
+      <<: *health
+      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+    restart: unless-stopped
+
+  mlflow-db:
+    image: postgres:17.6-bookworm
+    environment:
+      POSTGRES_DB: ${MLFLOW_DB:-mlflow}
+      POSTGRES_USER: ${MLFLOW_DB_USER:-mlflow}
+      POSTGRES_PASSWORD: ${MLFLOW_DB_PASSWORD:?Set MLFLOW_DB_PASSWORD in .env}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    volumes: [mlflow-db-data:/var/lib/postgresql/data]
+    networks: [mlflow-db]
+    healthcheck:
+      <<: *health
+      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4.6-bookworm
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    command: [sh, -ec, 'exec redis-server --appendonly yes --appendfsync everysec --requirepass "$$REDIS_PASSWORD"']
+    volumes: [redis-data:/data]
+    networks: [queue]
+    healthcheck:
+      <<: *health
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -qx PONG']
+    restart: unless-stopped
+
+  minio:
+    build:
+      context: ..
+      dockerfile: infrastructure/docker/minio.Dockerfile
+      target: server
+    command: [server, /data, --console-address, ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes: [minio-data:/data]
+    tmpfs: [/tmp]
+    networks: [objects, management]
+    healthcheck:
+      <<: *health
+      test: [CMD-SHELL, 'mc --config-dir /tmp/mc-health alias set health http://127.0.0.1:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null 2>&1 && mc --config-dir /tmp/mc-health ready health >/dev/null 2>&1']
+    restart: unless-stopped
+
+  minio-init:
+    build:
+      context: ..
+      dockerfile: infrastructure/docker/minio.Dockerfile
+      target: client
+    entrypoint: [/bin/sh, /bootstrap/init.sh]
+    command: []
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
+      MLFLOW_ARTIFACT_BUCKET: ${MLFLOW_ARTIFACT_BUCKET:-mlflow-artifacts}
+      MLFLOW_S3_ACCESS_KEY: ${MLFLOW_S3_ACCESS_KEY:?Set MLFLOW_S3_ACCESS_KEY in .env}
+      MLFLOW_S3_SECRET_KEY: ${MLFLOW_S3_SECRET_KEY:?Set MLFLOW_S3_SECRET_KEY in .env}
+    volumes:
+      - ./minio/init.sh:/bootstrap/init.sh:ro
+    tmpfs: [/tmp]
+    networks: [objects]
+    depends_on:
+      minio: {condition: service_healthy}
+    restart: "no"
+
+  qdrant:
+    build:
+      context: ..
+      dockerfile: infrastructure/docker/qdrant.Dockerfile
+    environment:
+      QDRANT__TELEMETRY_DISABLED: "true"
+    volumes: [qdrant-data:/qdrant/storage]
+    networks: [vectors]
+    restart: unless-stopped
+
+  mlflow:
+    build:
+      context: ..
+      dockerfile: infrastructure/docker/mlflow.Dockerfile
+    environment:
+      MLFLOW_DB: ${MLFLOW_DB:-mlflow}
+      MLFLOW_DB_USER: ${MLFLOW_DB_USER:-mlflow}
+      MLFLOW_DB_PASSWORD: ${MLFLOW_DB_PASSWORD:?Set MLFLOW_DB_PASSWORD in .env}
+      MLFLOW_ARTIFACT_BUCKET: ${MLFLOW_ARTIFACT_BUCKET:-mlflow-artifacts}
+      MLFLOW_S3_ENDPOINT_URL: ${MLFLOW_S3_ENDPOINT_URL:-http://minio:9000}
+      AWS_ACCESS_KEY_ID: ${MLFLOW_S3_ACCESS_KEY:?Set MLFLOW_S3_ACCESS_KEY in .env}
+      AWS_SECRET_ACCESS_KEY: ${MLFLOW_S3_SECRET_KEY:?Set MLFLOW_S3_SECRET_KEY in .env}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      AWS_EC2_METADATA_DISABLED: "true"
+      MLFLOW_SERVER_ALLOWED_HOSTS: ${MLFLOW_SERVER_ALLOWED_HOSTS:-localhost:5000,127.0.0.1:5000,mlflow:5000}
+      MLFLOW_SERVER_CORS_ALLOWED_ORIGINS: ${MLFLOW_SERVER_CORS_ALLOWED_ORIGINS:-http://localhost:5000,http://127.0.0.1:5000}
+      MLFLOW_ENABLE_ASYNC_TRACE_LOGGING: "false"
+      DO_NOT_TRACK: "1"
+    ports:
+      - "127.0.0.1:${MLFLOW_PORT:-5000}:5000"
+    networks: [tracking, mlflow-db, objects, management]
+    depends_on:
+      mlflow-db: {condition: service_healthy}
+      minio-init: {condition: service_completed_successfully}
+    healthcheck:
+      <<: *health
+      start_period: 90s
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=3)"]
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+
+volumes:
+  postgres-data:
+  mlflow-db-data:
+  minio-data:
+  redis-data:
+  qdrant-data:
+
+networks:
+  web:
+  management:
+  app-db: {internal: true}
+  mlflow-db: {internal: true}
+  objects: {internal: true}
+  queue: {internal: true}
+  vectors: {internal: true}
+  tracking: {internal: true}

@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "medical-ai-backend"
+version = "0.1.0"
+description = "Medical AI infrastructure foundation"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi==0.121.1",
+  "uvicorn==0.38.0",
+  "pydantic-settings==2.11.0",
+  "celery[redis]==5.5.3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx==0.28.1",
+  "mypy==1.18.2",
+  "pytest==8.4.2",
+  "ruff==0.14.4",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["celery", "celery.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

@@ -1,0 +1,18 @@
+{
+  "mc": {
+    "version": "RELEASE.2025-04-16T18-13-26Z",
+    "repository": "minio/mc",
+    "sha256": {
+      "amd64": "ac90da87a35641be5a0ac75d49de5161ddb47d629b5ba01261b0ae9e00aea15f",
+      "arm64": "61bb88e7435919834478ddd4d405a6de6d2c227079da5e8ee9655147398819a0"
+    }
+  },
+  "minio": {
+    "version": "RELEASE.2025-04-22T22-12-26Z",
+    "repository": "minio/minio",
+    "sha256": {
+      "amd64": "53e2a2cb16c5366ea6fbbc479c19ddb4c6a0948273e752f740fb1fbf27bb817c",
+      "arm64": "6c2f3142c94240206123177f4ba1e360daa5d1e0a4962e90757ef4f92c3ab57c"
+    }
+  }
+}
