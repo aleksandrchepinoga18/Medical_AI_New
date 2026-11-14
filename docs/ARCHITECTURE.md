@@ -53,15 +53,19 @@ flowchart LR
 
 ## Сервисы и хранение
 
+Код подэтапов 3.1–3.3 подготовлен, ручная приёмка ожидается. Текущие функции
+Backend — auth и Document Ingestion; утверждения о «будущих документах» в описании
+исходного этапа 1 ниже являются историческими. Инструкция: [STAGE3.md](STAGE3.md).
+
 | Сервис | Данные | Постоянный том | Доступ с хоста |
 | --- | --- | --- | --- |
-| backend | процесс API, пока только liveness | нет | 127.0.0.1:8000 |
+| backend | liveness, auth, защищённый document API | нет | 127.0.0.1:8000 |
 | frontend | Next.js | dev cache в слое контейнера; прежние dev-тома не подключены | 127.0.0.1:3000 |
-| postgres | будущие данные приложения | postgres-data | не опубликован |
+| postgres | auth, документы, версии текста, transactional outbox | postgres-data | не опубликован |
 | mlflow-db | эксперименты, runs, метрики, параметры, Registry | mlflow-db-data | не опубликован |
 | minio | объекты и артефакты MLflow | minio-data | только Console 127.0.0.1:9001 |
 | redis | broker DB 0, results DB 1, AOF | redis-data | не опубликован |
-| worker | Celery, без бизнес-задач | нет | не опубликован |
+| worker | Celery ingestion, встроенный outbox dispatcher | нет | не опубликован |
 | qdrant | будущие векторы и payload | qdrant-data | не опубликован |
 | mlflow | Tracking UI/API, Registry, artifact proxy | в PostgreSQL и MinIO | 127.0.0.1:5000 |
 | minio-init | одноразовый bootstrap bucket/account/policy | нет | не опубликован |
@@ -85,6 +89,49 @@ Internal-сети не дают прямой выход наружу; multihomed
 также имеют обычную сеть. Это сегментация Compose, а не замена ACL или сетевой
 политики production. PostgreSQL, Redis, Qdrant и S3 API MinIO не публикуются
 на хост. Сервисы без реализованного ACL не допускают реальных пользователей.
+
+## Document Ingestion — подэтапы 3.1–3.3
+
+Модуль `app/documents` использует существующие `AuthenticatedUser`, CSRF и
+серверные сессии. Все чтения/скачивание/retry выбирают документ по ID и owner_id;
+чужой документ возвращает 404. Публичный API не раскрывает bucket/object key.
+Ручной multipart-разбор начинается после auth/CSRF, принимает только одно поле
+file и ограничивает фактическое тело до multipart-разбора, в том числе без
+Content-Length. Временные файлы закрываются при ошибке и отключении клиента.
+
+`documents` и `document_ingestion_jobs` создаются одной транзакцией до MinIO write:
+сохранён server key, исходный SHA-256, размер и delayed pending outbox. После
+подтверждения MinIO документ становится queued, available_at задания — текущим.
+При сбое API не удаляет и не перезаписывает оригинал; по окончании grace worker
+проверяет сохранённый key/размер/SHA-256. Если объекта нет — UPLOAD_INCOMPLETE.
+При одинаковом owner/Idempotency-Key и содержимом возвращается прежний документ,
+при другом содержимом — 409. Проверка квот сериализована блокировкой users row.
+
+В существующем worker после `worker_ready` запускается dispatcher thread с
+собственным engine. PostgreSQL SKIP LOCKED и короткий publishing lease позволяют
+нескольким workers безопасно публиковать pending задания. Redis не является
+источником статуса документа. Published без обработки и processing с истёкшим
+lease возвращаются к публикации. Ошибки публикации/хранилища имеют ограниченный
+budget; документ после исчерпания требует явного retry. Новых сервисов/beat нет.
+Перед обработкой задача получает новый lease UUID. Результат принимается только
+при совпадении неистёкшего lease; поздние и дублированные сообщения не создают
+повторной версии текста. Version уникальна для документа; retry создаёт новую.
+
+Worker сверяет оригинал и запускает `python -m app.documents.extract` как отдельный
+процесс с timeout; на Linux дополнительно ограничены CPU/адресное пространство.
+PyMuPDF извлекает PDF по страницам, python-docx — абзацы/таблицы в порядке OOXML.
+Сохраняются NFC-текст, offsets по Unicode code points и локаторы page/block.
+Без OCR пустые страницы PDF дают needs_ocr, частичный текст сохраняется.
+DOCX ограничивается ZIP size/entry count, текстом и числом блоков; точное число
+отрендеренных страниц DOCX без renderer не определяется. Внешние ссылки не
+загружаются, JavaScript/макросы не выполняются. SDK/парсер не пишет тексты в логи.
+
+Next.js сохраняет серверный private layout и существующий same-origin `/api`
+rewrite. Tailwind v4 и локальные адаптированные shadcn/ui primitives обеспечивают
+desktop sidebar и мобильный Radix Sheet, загрузку, список/пагинацию, polling,
+скачивание, retry и безопасный plain-text просмотр. Next.js/React не обновлены.
+MinIO bootstrap, MLflow и его policy/учётная запись не меняются.
+Миграции 0001_auth/0002_documents в подэтапах 3.2–3.3 не изменены, новых нет.
 
 ## MLflow Tracking, Registry и артефакты
 

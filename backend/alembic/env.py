@@ -3,6 +3,7 @@ from sqlalchemy import create_engine, pool
 from alembic import context
 from app.auth.models import Base
 from app.db import database_url, get_settings
+from app.documents import models as document_models  # noqa: F401
 
 
 def include_object(obj, name, type_, reflected, compare_to):

@@ -1,4 +1,4 @@
-"""HTTP entry point: infrastructure liveness and stage 2 authentication."""
+"""HTTP entry point: liveness, authentication and protected document ingestion."""
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -6,9 +6,11 @@ from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
 from app.auth.routes import router
+from app.documents.routes import router as documents_router
 
 app = FastAPI(title="Medical AI", version="0.1.0", docs_url=None, redoc_url=None)
 app.include_router(router)
+app.include_router(documents_router)
 
 
 @app.exception_handler(RequestValidationError)

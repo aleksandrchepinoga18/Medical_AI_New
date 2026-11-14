@@ -9,6 +9,7 @@ description = "Medical AI infrastructure foundation"
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "fastapi==0.121.1",
+  "starlette==0.49.3",
   "uvicorn==0.38.0",
   "pydantic-settings==2.11.0",
   "celery[redis]==5.5.3",
@@ -17,6 +18,10 @@ dependencies = [
   "psycopg[binary]==3.2.12",
   "argon2-cffi==25.1.0",
   "email-validator==2.3.0",
+  "minio==7.2.18",
+  "python-multipart==0.0.20",
+  "pymupdf==1.26.6",
+  "python-docx==1.2.0",
 ]
 
 [project.optional-dependencies]
@@ -33,6 +38,8 @@ include = ["app*"]
 [tool.ruff]
 target-version = "py312"
 line-length = 100
+extend-exclude = ["build", "dist", "*.egg-info"]
+force-exclude = true
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
@@ -43,7 +50,7 @@ strict = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["celery", "celery.*"]
+module = ["celery", "celery.*", "kombu", "pymupdf", "pymupdf.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

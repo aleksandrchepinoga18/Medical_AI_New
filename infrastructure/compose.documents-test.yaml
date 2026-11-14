@@ -1,0 +1,82 @@
+# Isolated synthetic integration environment: no host ports, production env or named volumes.
+x-test-environment: &test-environment
+  APP_ENV: development
+  POSTGRES_HOST: postgres
+  POSTGRES_DB: medical_ai_documents_test
+  POSTGRES_USER: synthetic_test_user
+  POSTGRES_PASSWORD: synthetic-test-postgres-password
+  REDIS_HOST: redis
+  REDIS_PASSWORD: synthetic-test-redis-password
+  AUTH_ORIGIN: http://localhost:3000
+  DOCUMENTS_S3_ENDPOINT: minio:9000
+  DOCUMENTS_S3_BUCKET: medical-ai-documents-test
+  DOCUMENTS_S3_ACCESS_KEY: synthetic-test-root
+  DOCUMENTS_S3_SECRET_KEY: synthetic-test-minio-password
+  DOCUMENTS_OUTBOX_ENABLED: "false"
+  RUN_AUTH_INTEGRATION: "1"
+  RUN_DOCUMENT_INTEGRATION: "1"
+
+services:
+  postgres:
+    image: postgres:17.6-bookworm
+    environment:
+      POSTGRES_DB: medical_ai_documents_test
+      POSTGRES_USER: synthetic_test_user
+      POSTGRES_PASSWORD: synthetic-test-postgres-password
+    tmpfs: [/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  redis:
+    image: redis:7.4.6-bookworm
+    command: [redis-server, --requirepass, synthetic-test-redis-password, --save, ""]
+    tmpfs: [/data]
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH=synthetic-test-redis-password redis-cli ping']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  minio:
+    build:
+      context: ..
+      dockerfile: infrastructure/docker/minio.Dockerfile
+      target: server
+    command: [server, /data]
+    environment:
+      MINIO_ROOT_USER: synthetic-test-root
+      MINIO_ROOT_PASSWORD: synthetic-test-minio-password
+    tmpfs: [/data, /tmp]
+    healthcheck:
+      test: [CMD-SHELL, 'mc --config-dir /tmp/health alias set test http://127.0.0.1:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null 2>&1 && mc --config-dir /tmp/health ready test >/dev/null 2>&1']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  worker:
+    build:
+      context: ..
+      dockerfile: infrastructure/docker/backend.Dockerfile
+      target: development
+    environment: *test-environment
+    command: [celery, -A, app.workers.celery_app:celery_app, worker, --loglevel=WARNING, --concurrency=1]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+    healthcheck:
+      test: [CMD-SHELL, 'celery -A app.workers.celery_app:celery_app inspect ping --destination "celery@$$HOSTNAME" --timeout 8 >/dev/null 2>&1']
+      interval: 10s
+      timeout: 15s
+      retries: 20
+    tmpfs: [/tmp]
+  tests:
+    build:
+      context: ..
+      dockerfile: infrastructure/docker/backend.Dockerfile
+      target: development
+    environment: *test-environment
+    command: [python, -m, pytest, -m, integration]
+    depends_on:
+      worker: {condition: service_healthy}
+    tmpfs: [/tmp]

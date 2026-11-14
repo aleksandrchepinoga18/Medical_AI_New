@@ -10,6 +10,6 @@ def test_liveness_contract() -> None:
     assert response.json() == {"status": "ok"}
 
 
-def test_business_routes_are_not_exposed() -> None:
+def test_document_routes_require_authentication() -> None:
     with TestClient(app) as client:
-        assert client.get("/documents").status_code == 404
+        assert client.get("/documents").status_code == 401
