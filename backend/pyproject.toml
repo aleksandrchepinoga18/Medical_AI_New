@@ -12,6 +12,11 @@ dependencies = [
   "uvicorn==0.38.0",
   "pydantic-settings==2.11.0",
   "celery[redis]==5.5.3",
+  "sqlalchemy==2.0.44",
+  "alembic==1.17.1",
+  "psycopg[binary]==3.2.12",
+  "argon2-cffi==25.1.0",
+  "email-validator==2.3.0",
 ]
 
 [project.optional-dependencies]
@@ -44,3 +49,4 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = ["integration: requires dedicated PostgreSQL test database"]

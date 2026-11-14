@@ -8,6 +8,14 @@ x-health: &health
 
 x-app-environment: &app-environment
   APP_ENV: ${APP_ENV:-development}
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB:-medical_ai}
+  POSTGRES_USER: ${POSTGRES_USER:-medical_ai}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+  AUTH_ORIGIN: ${AUTH_ORIGIN:-http://localhost:3000}
+  AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
+  AUTH_SESSION_SECONDS: ${AUTH_SESSION_SECONDS:-28800}
   REDIS_HOST: redis
   REDIS_PORT: "6379"
   REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}

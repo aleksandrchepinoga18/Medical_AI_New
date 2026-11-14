@@ -1,8 +1,11 @@
+import Link from "next/link";
+
 export default function Home() {
   return (
     <main>
       <h1>Medical AI</h1>
-      <p>Платформа в разработке. Пользовательские функции пока недоступны.</p>
+      <p>Личный кабинет Medical AI</p>
+      <Link href="/login">Вход</Link>{" "}<Link href="/register">Регистрация</Link>
     </main>
   );
 }
