@@ -1,4 +1,4 @@
-"""Celery configuration; no business tasks are registered yet."""
+"""Document ingestion and personal indexing share the existing broker and worker."""
 
 from celery import Celery
 from celery.signals import worker_process_init, worker_ready, worker_shutdown
@@ -7,6 +7,7 @@ from kombu import Queue
 from app.core.config import Settings
 from app.db import get_engine
 from app.documents.tasks import process_document_task
+from app.rag.indexing import process_index_task
 from app.workers.ingestion_dispatcher import OutboxDispatcher
 
 settings = Settings()
@@ -28,7 +29,7 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     broker_connection_timeout=3,
     broker_transport_options={"socket_connect_timeout": 3, "socket_timeout": 3},
-    task_queues=(Queue("celery"), Queue("document_ingestion")),
+    task_queues=(Queue("celery"), Queue("document_ingestion"), Queue("document_indexing")),
 )
 
 celery_app.task(
@@ -39,6 +40,15 @@ celery_app.task(
     reject_on_worker_lost=True,
     time_limit=settings.documents_processing_seconds + 60,
 )(process_document_task)
+
+celery_app.task(
+    name="rag.index",
+    queue="document_indexing",
+    ignore_result=True,
+    acks_late=True,
+    reject_on_worker_lost=True,
+    time_limit=settings.rag_index_seconds + 60,
+)(process_index_task)
 
 dispatcher: OutboxDispatcher | None = None
 
@@ -58,8 +68,17 @@ def start_outbox(**kwargs: object) -> None:
             retry=False,
         )
 
+    def index_publish(job_id: UUID, token: UUID) -> None:
+        celery_app.send_task(
+            "rag.index",
+            args=[str(job_id), str(token)],
+            queue="document_indexing",
+            ignore_result=True,
+            retry=False,
+        )
+
     if settings.documents_outbox_enabled:
-        dispatcher = OutboxDispatcher(settings, publish)
+        dispatcher = OutboxDispatcher(settings, publish, index_publish)
         dispatcher.start()
 
 

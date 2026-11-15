@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.documents.models import Document, DocumentIngestionJob, DocumentTextVersion
 from app.integrations.object_storage import ObjectStorage, OriginalNotFound, StorageError
+from app.rag.service import enqueue
 
 
 class ProcessingError(Exception):
@@ -191,17 +192,17 @@ def process_job(job_id: UUID, engine: Engine, storage: ObjectStorage, settings: 
         else:
             assert extracted is not None
             library = "pymupdf" if document.format == "pdf" else "python-docx"
-            db.add(
-                DocumentTextVersion(
-                    document_id=document_id,
-                    version=version,
-                    normalized_text=extracted.text,
-                    locators=extracted.locators,
-                    extractor_version=(
-                        f"{document.format}:{package_version(library)}:stage3-norm-v1"
-                    ),
-                )
+            text_version = DocumentTextVersion(
+                document_id=document_id,
+                version=version,
+                normalized_text=extracted.text,
+                locators=extracted.locators,
+                extractor_version=f"{document.format}:{package_version(library)}:stage3-norm-v1",
             )
+            db.add(text_version)
+            if settings.rag_enabled and extracted.status == "ready":
+                db.flush()
+                enqueue(db, document, text_version)
             document.status = extracted.status
             document.error_code = "OCR_REQUIRED" if extracted.status == "needs_ocr" else None
             document.updated_at = datetime.now(UTC)

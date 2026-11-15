@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   list: vi.fn(), upload: vi.fn(), retry: vi.fn(), download: vi.fn(), details: vi.fn(),
 }));
 vi.mock("next/navigation", () => ({ useRouter: () => mocks.router }));
+vi.mock("../components/documents/index-panel", () => ({ IndexPanel: () => null }));
 vi.mock("../lib/documents-api", async importOriginal => ({
   ...await importOriginal<typeof import("../lib/documents-api")>(),
   listDocuments: mocks.list, uploadDocument: mocks.upload, retryDocument: mocks.retry,
@@ -89,7 +90,7 @@ it("keeps the same upload key after a network failure", async () => {
 
 it("renders extracted document text as text rather than HTML", async () => {
   mocks.details.mockResolvedValue({ ...item, status: "ready", error_code: null,
-    text_version: { version: 1, normalized_text: "<script>synthetic</script>" } });
+    text_version: { version: 1, normalized_text: "<script>synthetic</script>", locators: [] } });
   render(<DocumentDetails id="synthetic-id" />);
   expect(await screen.findByText("<script>synthetic</script>")).toBeInTheDocument();
   expect(document.querySelector("script")).toBeNull();

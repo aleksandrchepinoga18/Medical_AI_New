@@ -1,0 +1,4 @@
+# TEMPORARY: explicit download only. Recreate with compose.rag.yaml afterwards.
+services:
+  ollama:
+    networks: [vectors, management]

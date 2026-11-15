@@ -1,0 +1,20 @@
+{
+  "version": "synthetic-personal-v1",
+  "k": 3,
+  "documents": [
+    {"id": "garden", "text": "Синтетическая инструкция: в учебном саду поливают томаты утром. Датчик влажности помогает выбрать время полива растений."},
+    {"id": "library", "text": "Синтетический регламент: книги в библиотеке возвращают через четырнадцать дней. Продлить срок выдачи можно в личном кабинете читателя."},
+    {"id": "train", "text": "Synthetic timetable: the blue train departs at 08:30 from platform seven. Tickets can be exchanged before departure."},
+    {"id": "backup", "text": "Synthetic operations guide: encrypted backups run nightly. Restore a backup in a separate environment and verify its checksum."},
+    {"id": "bread", "text": "Synthetic recipe: bread dough contains flour, water, salt and yeast. Let the dough rise before baking it in the oven."},
+    {"id": "museum", "text": "Синтетическое расписание: музей открыт со вторника по воскресенье. В понедельник экспозиция закрыта для посетителей."}
+  ],
+  "queries": [
+    {"query": "Когда лучше поливать помидоры?", "relevance": {"garden": 3}},
+    {"query": "Как продлить срок возврата библиотечной книги?", "relevance": {"library": 3}},
+    {"query": "Which platform does the morning blue train use?", "relevance": {"train": 3}},
+    {"query": "How should we verify a restored backup?", "relevance": {"backup": 3}},
+    {"query": "What ingredients go into bread dough?", "relevance": {"bread": 3}},
+    {"query": "В какой день музей не принимает посетителей?", "relevance": {"museum": 3}}
+  ]
+}

@@ -83,8 +83,14 @@ def dispatch_once(engine: Engine, publish: Callable[[UUID], None], settings: Set
 
 
 class OutboxDispatcher:
-    def __init__(self, settings: Settings, publish: Callable[[UUID], None]) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        publish: Callable[[UUID], None],
+        index_publish: Callable[[UUID, UUID], None] | None = None,
+    ) -> None:
         self.settings, self.publish = settings, publish
+        self.index_publish = index_publish
         self.stopped = threading.Event()
         self.thread = threading.Thread(target=self.run, name="document-outbox", daemon=True)
 
@@ -117,6 +123,19 @@ class OutboxDispatcher:
                 except Exception:
                     # Never print driver parameters or document data; DB is authoritative.
                     logger.warning("document_outbox_unavailable")
+                if self.settings.rag_enabled and self.index_publish is not None:
+                    from app.rag.indexing import dispatch_index_once
+
+                    try:
+                        for _ in range(20):
+                            if self.stopped.is_set() or not dispatch_index_once(
+                                engine,
+                                self.index_publish,
+                                self.settings,
+                            ):
+                                break
+                    except Exception:
+                        logger.warning("rag_outbox_unavailable")
                 self.stopped.wait(self.settings.documents_outbox_interval)
         finally:
             engine.dispose()

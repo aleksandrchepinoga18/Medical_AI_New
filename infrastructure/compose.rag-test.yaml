@@ -1,0 +1,82 @@
+# Standalone synthetic environment. Never combine with application Compose files.
+x-environment: &environment
+  APP_ENV: development
+  POSTGRES_HOST: postgres
+  POSTGRES_DB: medical_ai_rag_test
+  POSTGRES_USER: synthetic_rag_user
+  POSTGRES_PASSWORD: synthetic-rag-password
+  REDIS_HOST: redis
+  REDIS_PASSWORD: synthetic-rag-redis
+  AUTH_ORIGIN: http://localhost:3000
+  DOCUMENTS_OUTBOX_ENABLED: "false"
+  RAG_ENABLED: "true"
+  RAG_OLLAMA_URL: http://ollama:11434
+  RAG_EMBEDDING_MODEL: bge-m3:567m
+  RAG_EMBEDDING_DIMENSIONS: "1024"
+  RAG_QDRANT_URL: http://qdrant:6333
+  RAG_COLLECTION: medical_ai_personal_test
+  RUN_RAG_INTEGRATION: "1"
+
+services:
+  postgres:
+    image: postgres:17.6-bookworm
+    environment:
+      POSTGRES_DB: medical_ai_rag_test
+      POSTGRES_USER: synthetic_rag_user
+      POSTGRES_PASSWORD: synthetic-rag-password
+    tmpfs: [/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  redis:
+    image: redis:7.4.6-bookworm
+    command: [redis-server, --requirepass, synthetic-rag-redis, --save, ""]
+    tmpfs: [/data]
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH=synthetic-rag-redis redis-cli ping']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  qdrant:
+    build:
+      context: ..
+      dockerfile: infrastructure/docker/qdrant.Dockerfile
+    tmpfs: [/qdrant/storage]
+  ollama:
+    image: ollama/ollama:0.6.8
+    tmpfs: [/root/.ollama]
+    healthcheck:
+      test: [CMD, ollama, list]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+  worker:
+    build:
+      context: ..
+      dockerfile: infrastructure/docker/backend.Dockerfile
+      target: development
+    environment: *environment
+    command: [celery, -A, app.workers.celery_app:celery_app, worker, --loglevel=WARNING, --concurrency=2]
+    tmpfs: [/tmp]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+      ollama: {condition: service_healthy}
+    healthcheck:
+      test: [CMD-SHELL, 'celery -A app.workers.celery_app:celery_app inspect ping --destination "celery@$$HOSTNAME" --timeout 8 >/dev/null 2>&1']
+      interval: 10s
+      timeout: 15s
+      retries: 30
+  tests:
+    build:
+      context: ..
+      dockerfile: infrastructure/docker/backend.Dockerfile
+      target: development
+    environment: *environment
+    command: [python, -m, pytest, -m, integration, tests/test_rag_integration.py]
+    tmpfs: [/tmp]
+    depends_on:
+      worker: {condition: service_healthy}

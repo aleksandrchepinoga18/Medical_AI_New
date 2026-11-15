@@ -1,8 +1,9 @@
 """Environment configuration without network connections at import time."""
 
+import re
 from urllib.parse import quote
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -44,6 +45,32 @@ class Settings(BaseSettings):
     documents_upload_grace_seconds: int = Field(default=300, ge=120, le=3600)
     documents_outbox_interval: int = Field(default=5, ge=1, le=60)
     documents_outbox_enabled: bool = True
+    rag_enabled: bool = False
+    rag_chunk_chars: int = Field(default=1200, ge=100, le=8000)
+    rag_chunk_overlap: int = Field(default=200, ge=0, le=4000)
+    rag_ollama_url: str = "http://ollama:11434"
+    rag_embedding_model: str = "bge-m3:567m"
+    rag_embedding_digest: str = ""
+    rag_embedding_dimensions: int = Field(default=1024, ge=1, le=8192)
+    rag_embedding_batch_size: int = Field(default=8, ge=1, le=64)
+    rag_http_timeout: int = Field(default=60, ge=1, le=300)
+    rag_index_seconds: int = Field(default=900, ge=30, le=7200)
+    rag_max_attempts: int = Field(default=5, ge=1, le=10)
+    rag_qdrant_url: str = "http://qdrant:6333"
+    rag_collection: str = "medical_ai_personal_v1"
+    rag_qdrant_api_key: SecretStr = SecretStr("")
+    rag_search_max_k: int = Field(default=20, ge=1, le=50)
+
+    @model_validator(mode="after")
+    def validate_rag(self) -> "Settings":
+        if self.rag_chunk_overlap >= self.rag_chunk_chars:
+            raise ValueError("RAG chunk overlap must be smaller than chunk size")
+        if self.rag_embedding_digest and not re.fullmatch(
+            r"[0-9a-f]{64}",
+            self.rag_embedding_digest,
+        ):
+            raise ValueError("RAG embedding digest must be a full SHA-256 digest")
+        return self
 
     def redis_url(self, database: int) -> str:
         password = quote(self.redis_password.get_secret_value(), safe="")

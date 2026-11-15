@@ -7,6 +7,7 @@ import { ArrowLeft, Download, RefreshCw } from "lucide-react";
 import { Card, CardContent, CardHeader } from "../ui/card";
 import { Button } from "../ui/button";
 import { StatusBadge } from "./status-badge";
+import { IndexPanel } from "./index-panel";
 import { activeStatuses, canDownload, canRetry, DocumentApiError, downloadDocument, getDocument,
   processingMessage, retryDocument, type DocumentDetails as Details } from "../../lib/documents-api";
 
@@ -54,8 +55,13 @@ export function DocumentDetails({ id }: { id: string }) {
           {canRetry(data) && <Button disabled={busy} onClick={() => action(() => retryDocument(data.id))}><RefreshCw />Повторить</Button>}</div>
       </div>
       {data.error_code && <p className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">{processingMessage(data.error_code)}</p>}
+      <IndexPanel id={id} ready={data.status === "ready"} />
       <Card><CardHeader><h2 className="font-semibold">Извлечённый текст</h2><p className="mt-1 text-xs text-muted-foreground">{data.text_version ? `Версия ${data.text_version.version}. Текст показан без медицинской интерпретации.` : "Текст появится после обработки документа."}</p></CardHeader>
-        <CardContent>{data.text_version ? <pre className="max-h-[65vh] overflow-auto whitespace-pre-wrap break-words font-sans text-sm leading-7">{data.text_version.normalized_text || "Текст не найден."}</pre>
+        <CardContent>{data.text_version ? <pre id="extracted-text" className="max-h-[65vh] overflow-auto whitespace-pre-wrap break-words font-sans text-sm leading-7">{data.text_version.locators.length
+          ? data.text_version.locators.map((locator, index) => <span key={index}
+            id={`source-${locator.kind}-${locator.index}`} className="block scroll-mt-24">
+            {data.text_version!.normalized_text.slice(Number(locator.start), Number(locator.end))}
+          </span>) : data.text_version.normalized_text || "Текст не найден."}</pre>
           : <p className="py-8 text-center text-sm text-muted-foreground">{activeStatuses.has(data.status) ? "Обработка продолжается…" : "Текст пока недоступен."}</p>}</CardContent></Card>
     </>}
   </main>;

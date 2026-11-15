@@ -157,7 +157,9 @@ def test_secrets_hidden_and_existing_configuration_still_works() -> None:
     validate_storage_settings(configured)
     assert "synthetic-secret-not-real" not in repr(configured)
     assert "synthetic-access" not in repr(configured)
-    original = Settings(redis_password=SecretStr("synthetic-unused"))
+    # The shared unit fixture removes ambient settings and disables file sources.
+    original = Settings(_env_file=None, redis_password=SecretStr("synthetic-unused"))
+    assert original.documents_s3_access_key.get_secret_value() == ""
     assert original.documents_s3_secret_key.get_secret_value() == ""
     with pytest.raises(ValidationError):
         settings(documents_max_bytes=0)

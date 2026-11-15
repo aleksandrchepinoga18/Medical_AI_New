@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState, type ReactNode } from "react";
-import { Activity, Files, FlaskConical, LogOut, Menu, MessageSquare, Settings, ShieldCheck } from "lucide-react";
+import { Activity, Files, FlaskConical, LogOut, Menu, MessageSquare, Search, Settings, ShieldCheck } from "lucide-react";
 import { Button } from "./ui/button";
 import { Sheet, SheetContent, SheetDescription, SheetTitle, SheetTrigger } from "./ui/sheet";
 import { cn } from "../lib/utils";
@@ -11,6 +11,7 @@ import { cn } from "../lib/utils";
 const links = [
   { href: "/chat", title: "Чат", icon: MessageSquare },
   { href: "/documents", title: "Документы", icon: Files },
+  { href: "/search", title: "Поиск", icon: Search },
   { href: "/analyses", title: "Анализы", icon: FlaskConical },
   { href: "/settings", title: "Настройки", icon: Settings },
 ];
