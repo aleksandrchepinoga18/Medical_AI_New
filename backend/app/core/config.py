@@ -1,6 +1,7 @@
 """Environment configuration without network connections at import time."""
 
 import re
+from typing import Literal
 from urllib.parse import quote
 
 from pydantic import Field, SecretStr, model_validator
@@ -46,6 +47,16 @@ class Settings(BaseSettings):
     documents_outbox_interval: int = Field(default=5, ge=1, le=60)
     documents_outbox_enabled: bool = True
     rag_enabled: bool = False
+    chat_enabled: bool = False
+    llm_model: str = "qwen2.5:7b-instruct"
+    llm_ollama_url: Literal["http://ollama:11434", "http://host.docker.internal:11434"] = (
+        "http://ollama:11434"
+    )
+    llm_timeout_seconds: int = Field(default=180, ge=5, le=600)
+    llm_context_tokens: int = Field(default=4096, ge=2048, le=32768)
+    llm_max_tokens: int = Field(default=1024, ge=32, le=4096)
+    chat_history_chars: int = Field(default=2000, ge=1000, le=64000)
+    chat_context_chars: int = Field(default=2000, ge=1000, le=32000)
     rag_chunk_chars: int = Field(default=1200, ge=100, le=8000)
     rag_chunk_overlap: int = Field(default=200, ge=0, le=4000)
     rag_ollama_url: str = "http://ollama:11434"

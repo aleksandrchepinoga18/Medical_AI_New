@@ -1,0 +1,31 @@
+# Standalone synthetic PostgreSQL; never combine with application Compose files.
+services:
+  postgres:
+    image: postgres:17.6-bookworm
+    environment:
+      POSTGRES_DB: medical_ai_chat_test
+      POSTGRES_USER: synthetic_chat
+      POSTGRES_PASSWORD: synthetic-chat-password
+    tmpfs: [/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U synthetic_chat -d medical_ai_chat_test']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  tests:
+    build:
+      context: ..
+      dockerfile: infrastructure/docker/backend.Dockerfile
+      target: development
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: medical_ai_chat_test
+      POSTGRES_USER: synthetic_chat
+      POSTGRES_PASSWORD: synthetic-chat-password
+      REDIS_PASSWORD: synthetic-chat-redis
+      RUN_CHAT_INTEGRATION: "1"
+      CHAT_ENABLED: "true"
+      RAG_ENABLED: "true"
+    command: [python, -m, pytest, tests/test_chat_integration.py, -q]
+    depends_on:
+      postgres: {condition: service_healthy}
