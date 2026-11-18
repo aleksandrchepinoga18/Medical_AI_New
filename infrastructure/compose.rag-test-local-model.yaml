@@ -1,0 +1,19 @@
+# Local integration using an existing Docker Ollama on a dedicated private bridge.
+services:
+  ollama:
+    profiles: [isolated]
+  worker:
+    depends_on: !override
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+    networks: [default, inference]
+  tests:
+    networks: [default, inference]
+
+networks:
+  default:
+    internal: true
+  inference:
+    external: true
+    name: medical-ai-rag-inference-test

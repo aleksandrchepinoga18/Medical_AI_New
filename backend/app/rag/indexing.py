@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.documents.models import Document, DocumentTextVersion
 from app.rag.adapters import OllamaEmbeddings, QdrantVectors, RagError, fingerprint
+from app.rag.bm25_index import sync_published
 from app.rag.chunking import chunk_text
 from app.rag.models import RagChunk, RagIndexJob
 from app.rag.service import latest_version
@@ -249,6 +250,11 @@ def _process_index(
             if job is not None:
                 retry_or_fail(job, settings, code)
                 db.commit()
+        return
+    if settings.rag_retrieval_mode == "hybrid":
+        sync_published(
+            engine, settings, vectors, user_id, document_id, version_id, operation, token
+        )
 
 
 def process_index_task(job_id: str, token: str) -> None:

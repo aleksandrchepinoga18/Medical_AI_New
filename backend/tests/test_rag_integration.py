@@ -1,15 +1,20 @@
 """Real PostgreSQL/Qdrant/Ollama/Redis/Celery, synthetic standalone Compose only."""
 
 import json
+import math
 import os
+import re
 import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from statistics import mean, median
 from uuid import UUID, uuid4, uuid5
 
+import pymupdf
 import pytest
 from alembic.config import Config
+from docx import Document as WordDocument
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import Session
@@ -17,16 +22,36 @@ from sqlalchemy.orm import Session
 from alembic import command
 from app.auth.models import User
 from app.db import database_url, get_db, get_settings
+from app.documents.extract import extract_docx, extract_pdf
 from app.documents.models import Document, DocumentIngestionJob, DocumentTextVersion
 from app.main import app
 from app.rag.adapters import OllamaEmbeddings, QdrantVectors, RagError
+from app.rag.bm25_index import backfill
 from app.rag.evaluation import metrics
+from app.rag.hybrid import QdrantBm25
 from app.rag.indexing import dispatch_index_once, process_index
 from app.rag.models import RagChunk, RagIndexJob
 from app.rag.service import enqueue, request_operation, search
 
 pytestmark = pytest.mark.integration
 PAST = datetime(2000, 1, 1, tzinfo=UTC)
+
+
+def embedding_model_digest(embeddings: OllamaEmbeddings) -> str:
+    model = embeddings.settings.rag_embedding_model
+    try:
+        response = embeddings.http.request("GET", "/api/tags")
+    except RagError as error:
+        pytest.fail(f"Cannot read Ollama /api/tags at http://ollama:11434 ({error.code})")
+    models = response.get("models") if isinstance(response, dict) else None
+    if not isinstance(models, list):
+        pytest.fail("Ollama /api/tags response has no model list")
+    for entry in models:
+        if isinstance(entry, dict) and entry.get("name") == model:
+            digest = entry.get("digest")
+            if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
+                return digest
+    pytest.fail(f"Ollama at http://ollama:11434 did not report {model} with a SHA-256 digest")
 
 
 @pytest.fixture(scope="module")
@@ -36,12 +61,19 @@ def environment():
     get_settings.cache_clear()
     settings = get_settings()
     if (
-        settings.postgres_db != "medical_ai_rag_test"
+        settings.postgres_host != "postgres"
+        or settings.postgres_db != "medical_ai_rag_test"
         or settings.rag_collection != "medical_ai_personal_test"
         or settings.rag_qdrant_url != "http://qdrant:6333"
         or settings.rag_ollama_url != "http://ollama:11434"
     ):
         pytest.fail("Refusing RAG integration tests outside synthetic environment")
+    embeddings = OllamaEmbeddings(settings)
+    embedding_model_digest(embeddings)
+    try:
+        embeddings.embed(["Synthetic RAG integration readiness check."])
+    except RagError as error:
+        pytest.fail(f"Ollama cannot embed with {settings.rag_embedding_model} ({error.code})")
     config = Config(str(Path(__file__).parents[1] / "alembic.ini"))
     command.upgrade(config, "head")
     command.check(config)
@@ -52,7 +84,7 @@ def environment():
             yield db
 
     app.dependency_overrides[get_db] = database
-    yield engine, settings, OllamaEmbeddings(settings), QdrantVectors(settings)
+    yield engine, settings, embeddings, QdrantVectors(settings)
     app.dependency_overrides.clear()
     engine.dispose()
     get_settings.cache_clear()
@@ -85,6 +117,9 @@ def seed(
     owner=None,
     value="Synthetic blue train departs from platform seven.",
     schedule=True,
+    *,
+    format_="pdf",
+    locators=None,
 ):
     with Session(engine) as db:
         if owner is None:
@@ -100,8 +135,8 @@ def seed(
             db.flush()
         document = Document(
             owner_id=owner,
-            original_filename="synthetic.pdf",
-            format="pdf",
+            original_filename=f"synthetic.{format_}",
+            format=format_,
             size_bytes=100,
             sha256="0" * 64,
             object_key=f"synthetic/{uuid4()}",
@@ -113,7 +148,11 @@ def seed(
             document_id=document.id,
             version=1,
             normalized_text=value,
-            locators=[{"kind": "page", "index": 1, "start": 0, "end": len(value)}],
+            locators=(
+                [{"kind": "page", "index": 1, "start": 0, "end": len(value)}]
+                if locators is None
+                else locators
+            ),
             extractor_version="synthetic-stage4",
         )
         db.add(version)
@@ -495,10 +534,7 @@ def test_synthetic_retrieval_evaluation(environment):
         name: sum(score[name] for score in scores) / len(scores)
         for name in ("recall", "mrr", "ndcg")
     }
-    models = environment[2].http.request("GET", "/api/tags")["models"]
-    digest = next(
-        model["digest"] for model in models if model["name"] == environment[1].rag_embedding_model
-    )
+    digest = embedding_model_digest(environment[2])
     print(
         json.dumps(
             {
@@ -515,3 +551,274 @@ def test_synthetic_retrieval_evaluation(environment):
     assert summary["recall"] >= 0.8
     assert summary["mrr"] >= 0.7
     assert summary["ndcg"] >= 0.7
+
+
+def test_hybrid_backfill_isolation_fallback_and_generation_lifecycle(environment, monkeypatch):
+    engine, settings, embeddings, vectors = environment
+    hybrid = settings.model_copy(update={"rag_retrieval_mode": "hybrid"})
+    hybrid_environment = engine, hybrid, embeddings, QdrantVectors(hybrid)
+    sparse_index = QdrantBm25(vectors)
+    term = "ZX-761"
+    owner, document, version, job_id = seed(engine, value=f"Synthetic panel {term}.")
+    generation = index(environment, job_id)
+    _, foreign_document, _, foreign_job = seed(engine, value=f"Foreign panel {term}.")
+    foreign_generation = index(environment, foreign_job)
+    with Session(engine) as db:
+        db.add(
+            RagChunk(
+                id=uuid5(version, "chars-v1:100:0:0:10"),
+                user_id=owner,
+                document_id=document,
+                text_version_id=version,
+                ordinal=0,
+                start_char=0,
+                end_char=10,
+                text="Prior layout",
+                sources=[],
+            )
+        )
+        db.commit()
+
+    assert query(hybrid_environment, owner, term) == query(environment, owner, term)
+    assert backfill(engine, settings, sparse_index) == backfill(engine, settings, sparse_index)
+    assert sparse_index.count(owner, [str(generation), str(foreign_generation)]) == 1
+    sparse_hits = sparse_index.query(
+        owner, term, [str(generation), str(foreign_generation)], 1, 5
+    )
+    assert [hit["payload"]["document_id"] for hit in sparse_hits] == [str(document)]
+    assert sparse_index.query(owner, "UNSEEN-432", [str(generation)], 1, 5) == []
+    with Session(engine) as db:
+        hits = search(db, owner, term, 5, *hybrid_environment[1:], require_hybrid=True)
+    assert len(hits) == 1 and hits[0]["score"] == pytest.approx(2 / 61)
+    assert hits[0]["sources"][0]["url"].endswith("#source-page-1")
+    assert hits[0]["text_version_id"] == str(version)
+
+    def fail(*args):
+        raise RagError("HTTP_503")
+
+    _, _, _, new_job = seed(engine, owner, "Separate synthetic report")
+    with monkeypatch.context() as mock:
+        mock.setattr(QdrantBm25, "upsert", fail)
+        new_generation = index(hybrid_environment, new_job)
+    assert query(hybrid_environment, owner, term) == query(environment, owner, term)
+    with Session(engine) as db, pytest.raises(RagError, match="BM25_COVERAGE_INCOMPLETE"):
+        search(db, owner, term, 5, *hybrid_environment[1:], require_hybrid=True)
+    backfill(engine, settings, sparse_index)
+    assert sparse_index.count(owner, [str(generation), str(new_generation)]) == 2
+
+    with monkeypatch.context() as mock:
+        mock.setattr(QdrantBm25, "query", fail)
+        assert query(hybrid_environment, owner, term) == query(environment, owner, term)
+    with Session(engine) as db:
+        request_operation(db, db.get(RagIndexJob, job_id), "index")
+    assert str(document) not in {
+        hit["document_id"] for hit in query(hybrid_environment, owner, term)
+    }
+    replacement = index(hybrid_environment, job_id)
+    assert sparse_index.count(owner, [str(generation)]) == 0
+    assert sparse_index.count(owner, [str(replacement)]) == 1
+    with Session(engine) as db:
+        request_operation(db, db.get(RagIndexJob, job_id), "delete")
+    assert str(document) not in {
+        hit["document_id"] for hit in query(hybrid_environment, owner, term)
+    }
+    index(hybrid_environment, job_id)
+    backfill(engine, settings, sparse_index)
+    assert sparse_index.count(owner, [str(replacement)]) == 0
+    assert str(foreign_document) not in {
+        hit["document_id"] for hit in query(hybrid_environment, owner, term)
+    }
+
+
+def test_hybrid_rejects_forged_lexical_point_after_rechecking_postgresql(environment, monkeypatch):
+    engine, settings, embeddings, vectors = environment
+    hybrid = settings.model_copy(update={"rag_retrieval_mode": "hybrid"})
+    owner, _, _, job_id = seed(engine)
+    generation = index(environment, job_id)
+    _, foreign_document, foreign_version, foreign_job = seed(engine)
+    index(environment, foreign_job)
+    with Session(engine) as db:
+        chunk_id = db.scalar(select(RagChunk.id).where(RagChunk.text_version_id == foreign_version))
+    forged = {
+        "id": str(uuid5(chunk_id, str(generation))),
+        "score": 100,
+        "payload": {
+            "user_id": str(owner),
+            "generation": str(generation),
+            "chunk_id": str(chunk_id),
+            "document_id": str(foreign_document),
+            "text_version_id": str(foreign_version),
+        },
+    }
+    monkeypatch.setattr(QdrantBm25, "query", lambda *args: [forged])
+    assert query((engine, hybrid, embeddings, vectors), owner) == [
+        {**hit, "score": pytest.approx(1 / 61)} for hit in query(environment, owner)
+    ]
+
+
+def extract_synthetic_report(report, directory):
+    path = directory / f"{report['id']}.{report['format']}"
+    if report["format"] == "pdf":
+        with pymupdf.open() as pdf:
+            page = pdf.new_page()
+            page.insert_text((72, 72), report["text"])
+            pdf.save(path)
+        result = extract_pdf(path, 5, 10000)
+    else:
+        word = WordDocument()
+        for line in report["text"].splitlines():
+            word.add_paragraph(line)
+        word.save(path)
+        result = extract_docx(path, 10000, 1000000)
+    assert result["status"] == "ready"
+    return result
+
+
+def evaluation_summary(dataset, rankings, durations, k):
+    queries = dataset["queries"]
+    assert len(queries) == len(rankings)
+    grades = [
+        metrics(ranking, example["relevance"], k)
+        for example, ranking in zip(queries, rankings, strict=True)
+        if example["relevance"]
+    ]
+    negatives = [
+        ranking for example, ranking in zip(queries, rankings, strict=True)
+        if not example["relevance"]
+    ]
+    false_matches = {}
+    for category in ("numeric", "date"):
+        cases = [
+            (ranking, set(example["decoys"]))
+            for example, ranking in zip(queries, rankings, strict=True)
+            if example["category"] == category
+        ]
+        false_matches[category] = {
+            "queries": len(cases),
+            "decoy_top1_rate": mean(bool(set(ranking[:1]) & decoys) for ranking, decoys in cases),
+            "decoy_at_k_rate": mean(bool(set(ranking) & decoys) for ranking, decoys in cases),
+        }
+    return {
+        **{name: mean(score[name] for score in grades) for name in ("recall", "mrr", "ndcg")},
+        "latency_ms_p50": median(durations),
+        "latency_ms_p95": sorted(durations)[math.ceil(0.95 * len(durations)) - 1],
+        "no_relevant_queries": len(negatives),
+        "no_relevant_nonempty_rate": mean(bool(ranking) for ranking in negatives),
+        "false_matches": false_matches,
+        "per_query": {
+            example["id"]: ranking for example, ranking in zip(queries, rankings, strict=True)
+        },
+    }
+
+
+def test_hybrid_retrieval_evaluation(environment, tmp_path):
+    engine, settings, embeddings, _ = environment
+    digest = embedding_model_digest(embeddings)
+    qdrant = environment[3].http.request("GET", "/")["version"]
+    assert qdrant == "1.15.5"
+    hybrid = settings.model_copy(
+        update={
+            "rag_retrieval_mode": "hybrid",
+            "rag_embedding_digest": digest,
+            "rag_collection": f"medical_ai_personal_test_eval_{uuid4().hex}",
+        }
+    )
+    configs = {"dense": hybrid.model_copy(update={"rag_retrieval_mode": "dense"}), "hybrid": hybrid}
+    embeddings = OllamaEmbeddings(hybrid)
+    vectors = QdrantVectors(hybrid)
+    dataset = json.loads(
+        (Path(__file__).parents[1] / "evaluation/hybrid_rag.json").read_text(encoding="utf-8")
+    )
+    owners = {}
+    labels = {}
+    for report in dataset["documents"]:
+        tenant = report["tenant"]
+        extracted = extract_synthetic_report(report, tmp_path)
+        owner, document, _, job_id = seed(
+            engine,
+            owners.get(tenant),
+            extracted["text"],
+            format_=report["format"],
+            locators=extracted["locators"],
+        )
+        owners[tenant] = owner
+        labels[str(document)] = report["id"], tenant
+        index((engine, hybrid, embeddings, vectors), job_id)
+
+    def retrieve(mode, example, k):
+        tenant = example["tenant"]
+        start = time.perf_counter()
+        with Session(engine) as db:
+            hits = search(
+                db,
+                owners[tenant],
+                example["query"],
+                k,
+                configs[mode],
+                embeddings,
+                vectors,
+                require_hybrid=(mode == "hybrid"),
+            )
+        elapsed = (time.perf_counter() - start) * 1000
+        assert len(hits) <= k
+        assert len({hit["chunk_id"] for hit in hits}) == len(hits)
+        ranking = []
+        for hit in hits:
+            label, owner = labels[hit["document_id"]]
+            assert owner == tenant and hit["sources"]
+            ranking.append(label)
+        return ranking, elapsed
+
+    repeats = 3
+    output = {}
+    for k in (3, 5):
+        rankings = {mode: [] for mode in configs}
+        durations = {mode: [] for mode in configs}
+        for mode in configs:
+            retrieve(mode, dataset["queries"][0], k)  # Warm each path before timing.
+        for repeat in range(repeats):
+            for index_, example in enumerate(dataset["queries"]):
+                order = ("dense", "hybrid") if (index_ + repeat) % 2 == 0 else ("hybrid", "dense")
+                for mode in order:
+                    ranking, elapsed = retrieve(mode, example, k)
+                    durations[mode].append(elapsed)
+                    if repeat == 0:
+                        rankings[mode].append(ranking)
+        output[k] = {
+            mode: evaluation_summary(dataset, rankings[mode], durations[mode], k)
+            for mode in configs
+        }
+    deltas = {
+        k: {
+            metric: by_mode["hybrid"][metric] - by_mode["dense"][metric]
+            for metric in ("recall", "mrr", "ndcg", "latency_ms_p50", "latency_ms_p95")
+        }
+        for k, by_mode in output.items()
+    }
+    quality_deltas = [
+        delta[metric] for delta in deltas.values() for metric in ("recall", "mrr", "ndcg")
+    ]
+    if max(quality_deltas) <= 0:
+        verdict = "no_gain_in_ranking_metrics"
+    elif min(quality_deltas) < 0:
+        verdict = "mixed_ranking_results"
+    else:
+        verdict = "ranking_gain_on_this_fixture"
+    print(
+        json.dumps(
+            {
+                "dataset": dataset["version"],
+                "model": settings.rag_embedding_model,
+                "digest": digest,
+                "dimensions": settings.rag_embedding_dimensions,
+                "chunk_chars": settings.rag_chunk_chars,
+                "chunk_overlap": settings.rag_chunk_overlap,
+                "qdrant": qdrant,
+                "latency_repeats": repeats,
+                "cutoffs": output,
+                "hybrid_minus_dense": deltas,
+                "ranking_verdict": verdict,
+            },
+            sort_keys=True,
+        )
+    )

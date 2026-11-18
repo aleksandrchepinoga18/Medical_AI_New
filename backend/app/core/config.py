@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     documents_outbox_interval: int = Field(default=5, ge=1, le=60)
     documents_outbox_enabled: bool = True
     rag_enabled: bool = False
+    rag_retrieval_mode: Literal["dense", "hybrid"] = "dense"
     chat_enabled: bool = False
     llm_model: str = "qwen2.5:7b-instruct"
     llm_ollama_url: Literal["http://ollama:11434", "http://host.docker.internal:11434"] = (

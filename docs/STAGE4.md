@@ -130,7 +130,7 @@ rd() {
     -f infrastructure/compose.rag-download.yaml "$@"
 }
 rt() {
-  docker compose -p medical-ai-stage4-tests \
+  COMPOSE_DISABLE_ENV_FILE=1 docker compose -p medical-ai-stage4-tests \
     -f infrastructure/compose.rag-test.yaml "$@"
 }
 
@@ -158,6 +158,10 @@ rc run --rm --no-deps frontend npm test
 эти проверки выполняйте с development override или отдельным test Compose.
 
 ## Изолированная интеграция и evaluation
+
+Для локального запуска с уже установленной моделью используйте
+[основную Docker Ollama через тестовую сеть](HYBRID_RAG.md#локальные-интеграционные-тесты-с-основной-ollama).
+Для CI с отдельной Ollama подходит приведённый ниже запуск.
 
 Этот Compose самостоятельный: без рабочих env-файлов, портов, named volumes или
 рабочих сетей. PostgreSQL/Redis/Qdrant/Ollama используют tmpfs. Загрузка модели

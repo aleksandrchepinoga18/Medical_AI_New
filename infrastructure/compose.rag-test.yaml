@@ -1,4 +1,5 @@
-# Standalone synthetic environment. Never combine with application Compose files.
+# Standalone synthetic environment with its own Ollama for CI.
+# For local reuse of a running Ollama, add compose.rag-test-local-model.yaml.
 x-environment: &environment
   APP_ENV: development
   POSTGRES_HOST: postgres

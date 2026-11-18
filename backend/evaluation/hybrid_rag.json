@@ -1,0 +1,38 @@
+{
+  "version": "synthetic-medical-hybrid-v1",
+  "documents": [
+    {"id": "a1c", "tenant": "a", "format": "pdf", "text": "Synthetic chemistry report. Date: 2025-01-18.\nHemoglobin A1c (HbA1c): 5.8%. Specimen: whole blood."},
+    {"id": "cbc", "tenant": "a", "format": "docx", "text": "Учебный общий анализ крови. Дата 2025-01-18.\nГемоглобин 139 г/л. Тромбоциты 244 x10^9/л.\nЛейкоциты 5,2 x10^9/л."},
+    {"id": "brca1", "tenant": "a", "format": "pdf", "text": "Synthetic sequencing worksheet. Run date: 2025-02-11.\nBRCA1 c.68_69delAG was recorded as an example variant."},
+    {"id": "brca2", "tenant": "a", "format": "pdf", "text": "Synthetic sequencing worksheet. Run date: 2025-02-12.\nBRCA2 c.5946delT was recorded as an example variant."},
+    {"id": "braf", "tenant": "a", "format": "pdf", "text": "Synthetic molecular log dated 2025-03-07.\nBRAF c.1799T>A (p.Val600Glu) was used for the simulated control."},
+    {"id": "potassium", "tenant": "a", "format": "docx", "text": "Учебная биохимия от 2025-02-11.\nКалий сыворотки 5,2 ммоль/л. Натрий 140 ммоль/л."},
+    {"id": "potassium-close", "tenant": "a", "format": "docx", "text": "Учебная биохимия от 2025-02-12.\nКалий сыворотки 5,3 ммоль/л. Натрий 141 ммоль/л."},
+    {"id": "crp", "tenant": "a", "format": "docx", "text": "Учебное исследование от 2025-01-19.\nС-реактивный белок 5,2 мг/л."},
+    {"id": "iron", "tenant": "a", "format": "pdf", "text": "Synthetic iron studies. Ferritin: 48 ng/mL.\nThe note describes ferritin as an indicator of stored iron."},
+    {"id": "transfer", "tenant": "a", "format": "docx", "text": "Учебный анализ обмена железа. Насыщение трансферрина 22%.\nТрансферрин переносит железо в крови."},
+    {"id": "echo", "tenant": "a", "format": "pdf", "text": "Synthetic ultrasound of the heart.\nLeft ventricular ejection fraction: 62%. Chamber size was recorded."},
+    {"id": "ecg", "tenant": "a", "format": "pdf", "text": "Synthetic electrocardiogram. Sinus rhythm, 62 beats per minute.\nElectrical tracing was recorded at rest."},
+    {"id": "b-potassium", "tenant": "b", "format": "docx", "text": "Учебная биохимия от 2025-02-11.\nКалий сыворотки 5,2 ммоль/л. Контрольная серия FJ-804."},
+    {"id": "b-a1c", "tenant": "b", "format": "pdf", "text": "Synthetic chemistry report. Date: 2025-01-18.\nHemoglobin A1c (HbA1c): 5.9%."},
+    {"id": "b-zinc", "tenant": "b", "format": "pdf", "text": "Synthetic trace element results. Zinc assay batch ZX-761.\nSerum zinc measurement recorded on 2025-04-22."}
+  ],
+  "queries": [
+    {"id": "analyte", "tenant": "a", "category": "exact", "query": "Hemoglobin A1c HbA1c", "relevance": {"a1c": 3}},
+    {"id": "analyte-ru", "tenant": "a", "category": "exact", "query": "С-реактивный белок", "relevance": {"crp": 3}},
+    {"id": "variant", "tenant": "a", "category": "gene", "query": "BRCA1 c.68_69delAG", "relevance": {"brca1": 3}},
+    {"id": "variant-braf", "tenant": "a", "category": "gene", "query": "c.1799T>A", "relevance": {"braf": 3}},
+    {"id": "sample-date", "tenant": "a", "category": "date", "query": "Какие исследования датированы 2025-01-18?", "relevance": {"a1c": 3, "cbc": 3}, "decoys": ["crp", "brca1", "brca2", "potassium", "potassium-close", "braf"]},
+    {"id": "run-date", "tenant": "a", "category": "date", "query": "Sequencing run on 2025-02-11", "relevance": {"brca1": 3}, "decoys": ["brca2", "braf"]},
+    {"id": "potassium-value", "tenant": "a", "category": "numeric", "query": "5.2 ммоль/л калий", "relevance": {"potassium": 3}, "decoys": ["cbc", "potassium-close", "crp"]},
+    {"id": "mass-quantity", "tenant": "a", "category": "numeric", "query": "Какой белок был 5,2 мг/л?", "relevance": {"crp": 3}, "decoys": ["cbc", "potassium", "potassium-close"]},
+    {"id": "heart-function", "tenant": "a", "category": "paraphrase", "query": "Where can I read about how effectively the heart pumps?", "relevance": {"echo": 3}},
+    {"id": "iron-review", "tenant": "a", "category": "paraphrase", "query": "Which reports help tell how much iron is in reserve versus being carried around the body?", "relevance": {"iron": 3, "transfer": 2}},
+    {"id": "general", "tenant": "a", "category": "no_match", "query": "Как работает паровая турбина?", "relevance": {}},
+    {"id": "missing-date", "tenant": "a", "category": "date", "query": "Исследование от 2025-01-17", "relevance": {}, "decoys": ["a1c", "cbc", "crp"]},
+    {"id": "missing-value", "tenant": "a", "category": "numeric", "query": "Калий 52 ммоль/л", "relevance": {}, "decoys": ["potassium", "potassium-close"]},
+    {"id": "foreign-only", "tenant": "a", "category": "tenant", "query": "Serum zinc assay batch ZX-761", "relevance": {}},
+    {"id": "own-zinc", "tenant": "b", "category": "tenant", "query": "Serum zinc assay batch ZX-761", "relevance": {"b-zinc": 3}},
+    {"id": "shared-analyte", "tenant": "b", "category": "tenant", "query": "HbA1c report for 2025-01-18", "relevance": {"b-a1c": 3}}
+  ]
+}

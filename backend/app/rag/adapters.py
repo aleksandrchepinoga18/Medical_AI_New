@@ -154,6 +154,39 @@ def match(key: str, value: str) -> dict[str, Any]:
     return {"key": key, "match": {"value": value}}
 
 
+def generation_filter(settings: Settings, user_id: UUID, generations: list[str]) -> dict[str, Any]:
+    return {
+        "must": [
+            match("pipeline", PIPELINE),
+            match("user_id", str(user_id)),
+            match("fingerprint", fingerprint(settings)),
+            {"key": "generation", "match": {"any": generations}},
+        ],
+    }
+
+
+def ensure_payload_indexes(http: JsonHttp, path: str, info: dict[str, Any]) -> None:
+    schema = info.get("payload_schema", {})
+    for field in (
+        "pipeline",
+        "user_id",
+        "document_id",
+        "text_version_id",
+        "generation",
+        "fingerprint",
+        "chunk_id",
+    ):
+        if field in schema:
+            if schema[field].get("data_type") != "keyword":
+                raise RagError("PAYLOAD_INDEX_MISMATCH")
+        else:
+            http.request(
+                "PUT",
+                path + "/index?wait=true",
+                {"field_name": field, "field_schema": "keyword"},
+            )
+
+
 class QdrantVectors:
     def __init__(self, settings: Settings) -> None:
         if not re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", settings.rag_collection):
@@ -202,28 +235,7 @@ class QdrantVectors:
                 if conflict.code != "HTTP_409":
                     raise
             info = self.inspect()
-        schema = info.get("payload_schema", {})
-        for field in (
-            "pipeline",
-            "user_id",
-            "document_id",
-            "text_version_id",
-            "generation",
-            "fingerprint",
-            "chunk_id",
-        ):
-            if field in schema:
-                if schema[field].get("data_type") != "keyword":
-                    raise RagError("PAYLOAD_INDEX_MISMATCH")
-            else:
-                self.http.request(
-                    "PUT",
-                    self.path + "/index?wait=true",
-                    {
-                        "field_name": field,
-                        "field_schema": "keyword",
-                    },
-                )
+        ensure_payload_indexes(self.http, self.path, info)
 
     def upsert(
         self,
@@ -297,14 +309,7 @@ class QdrantVectors:
                 "limit": k,
                 "with_payload": True,
                 "with_vector": False,
-                "filter": {
-                    "must": [
-                        match("pipeline", PIPELINE),
-                        match("user_id", str(user_id)),
-                        match("fingerprint", fingerprint(self.settings)),
-                        {"key": "generation", "match": {"any": generations}},
-                    ],
-                },
+                "filter": generation_filter(self.settings, user_id, generations),
             },
         )
         return list(result["result"]["points"])
