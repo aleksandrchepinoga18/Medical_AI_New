@@ -25,10 +25,11 @@ from app.db import database_url, get_db, get_settings
 from app.documents.extract import extract_docx, extract_pdf
 from app.documents.models import Document, DocumentIngestionJob, DocumentTextVersion
 from app.main import app
-from app.rag.adapters import OllamaEmbeddings, QdrantVectors, RagError
+from app.rag import bm25_index
+from app.rag.adapters import OllamaEmbeddings, QdrantVectors, RagError, generation_filter
 from app.rag.bm25_index import backfill
 from app.rag.evaluation import metrics
-from app.rag.hybrid import QdrantBm25
+from app.rag.hybrid import QdrantHybrid, bm25
 from app.rag.indexing import dispatch_index_once, process_index
 from app.rag.models import RagChunk, RagIndexJob
 from app.rag.service import enqueue, request_operation, search
@@ -557,12 +558,16 @@ def test_hybrid_backfill_isolation_fallback_and_generation_lifecycle(environment
     engine, settings, embeddings, vectors = environment
     hybrid = settings.model_copy(update={"rag_retrieval_mode": "hybrid"})
     hybrid_environment = engine, hybrid, embeddings, QdrantVectors(hybrid)
-    sparse_index = QdrantBm25(vectors)
+    index_v2 = QdrantHybrid(vectors)
     term = "ZX-761"
     owner, document, version, job_id = seed(engine, value=f"Synthetic panel {term}.")
     generation = index(environment, job_id)
     _, foreign_document, _, foreign_job = seed(engine, value=f"Foreign panel {term}.")
     foreign_generation = index(environment, foreign_job)
+    legacy_path = vectors.path + "_bm25_v1"
+    vectors.http.request(
+        "PUT", legacy_path, {"vectors": {}, "sparse_vectors": {"bm25": {"modifier": "idf"}}}
+    )
     with Session(engine) as db:
         db.add(
             RagChunk(
@@ -578,18 +583,41 @@ def test_hybrid_backfill_isolation_fallback_and_generation_lifecycle(environment
             )
         )
         db.commit()
+    old_hits = vectors.query(owner, embeddings.embed([term])[0], [str(generation)], 5)
+    legacy_point = {
+        "id": old_hits[0]["id"],
+        "vector": {"bm25": {"indices": [42], "values": [1]}},
+        "payload": old_hits[0]["payload"],
+    }
+    vectors.http.request("PUT", legacy_path + "/points?wait=true", {"points": [legacy_point]})
 
     assert query(hybrid_environment, owner, term) == query(environment, owner, term)
-    assert backfill(engine, settings, sparse_index) == backfill(engine, settings, sparse_index)
-    assert sparse_index.count(owner, [str(generation), str(foreign_generation)]) == 1
-    sparse_hits = sparse_index.query(
-        owner, term, [str(generation), str(foreign_generation)], 1, 5
-    )
+    with monkeypatch.context() as mock:
+        mock.setattr(OllamaEmbeddings, "embed", lambda *_: pytest.fail("Backfill re-embedded"))
+        assert backfill(engine, settings, vectors) == backfill(engine, settings, vectors)
+    generations = [str(generation), str(foreign_generation)]
+    assert index_v2.count(owner, generations) == 1
+    sparse_hits = index_v2.http.request(
+        "POST",
+        index_v2.path + "/points/query",
+        {
+            "query": bm25(term),
+            "using": "bm25",
+            "filter": generation_filter(settings, owner, generations),
+            "with_payload": True,
+        },
+    )["result"]["points"]
     assert [hit["payload"]["document_id"] for hit in sparse_hits] == [str(document)]
-    assert sparse_index.query(owner, "UNSEEN-432", [str(generation)], 1, 5) == []
+    get_points = {"ids": [sparse_hits[0]["id"]], "with_vector": True}
+    assert vectors.http.request("POST", legacy_path + "/points", get_points)["result"]
+    old = vectors.http.request("POST", vectors.path + "/points", get_points)["result"][0]
+    new = index_v2.http.request("POST", index_v2.path + "/points", get_points)["result"][0]
+    assert new["vector"]["dense"] == pytest.approx(old["vector"], abs=1e-6)
+    assert new["vector"]["bm25"]["indices"]
     with Session(engine) as db:
         hits = search(db, owner, term, 5, *hybrid_environment[1:], require_hybrid=True)
-    assert len(hits) == 1 and hits[0]["score"] == pytest.approx(2 / 61)
+    assert len(hits) == 1 and hits[0]["document_id"] == str(document)
+    assert hits[0]["score"] == pytest.approx(1.0)  # First place in each Qdrant prefetch.
     assert hits[0]["sources"][0]["url"].endswith("#source-page-1")
     assert hits[0]["text_version_id"] == str(version)
 
@@ -598,33 +626,34 @@ def test_hybrid_backfill_isolation_fallback_and_generation_lifecycle(environment
 
     _, _, _, new_job = seed(engine, owner, "Separate synthetic report")
     with monkeypatch.context() as mock:
-        mock.setattr(QdrantBm25, "upsert", fail)
+        mock.setattr(bm25_index, "sync_generation", fail)
         new_generation = index(hybrid_environment, new_job)
     assert query(hybrid_environment, owner, term) == query(environment, owner, term)
-    with Session(engine) as db, pytest.raises(RagError, match="BM25_COVERAGE_INCOMPLETE"):
+    with Session(engine) as db, pytest.raises(RagError, match="HYBRID_COVERAGE_INCOMPLETE"):
         search(db, owner, term, 5, *hybrid_environment[1:], require_hybrid=True)
-    backfill(engine, settings, sparse_index)
-    assert sparse_index.count(owner, [str(generation), str(new_generation)]) == 2
+    backfill(engine, settings, vectors)
+    assert index_v2.count(owner, [str(generation), str(new_generation)]) == 2
 
     with monkeypatch.context() as mock:
-        mock.setattr(QdrantBm25, "query", fail)
+        mock.setattr(QdrantHybrid, "query_hybrid", fail)
         assert query(hybrid_environment, owner, term) == query(environment, owner, term)
     with Session(engine) as db:
         request_operation(db, db.get(RagIndexJob, job_id), "index")
     assert str(document) not in {
         hit["document_id"] for hit in query(hybrid_environment, owner, term)
     }
-    replacement = index(hybrid_environment, job_id)
-    assert sparse_index.count(owner, [str(generation)]) == 0
-    assert sparse_index.count(owner, [str(replacement)]) == 1
+    replacement = index(environment, job_id)  # Worker still mirrors while retrieval is dense.
+    assert index_v2.count(owner, [str(generation)]) == 0
+    assert index_v2.count(owner, [str(replacement)]) == 1
     with Session(engine) as db:
         request_operation(db, db.get(RagIndexJob, job_id), "delete")
     assert str(document) not in {
         hit["document_id"] for hit in query(hybrid_environment, owner, term)
     }
-    index(hybrid_environment, job_id)
-    backfill(engine, settings, sparse_index)
-    assert sparse_index.count(owner, [str(replacement)]) == 0
+    index(environment, job_id)
+    backfill(engine, settings, vectors)
+    assert index_v2.count(owner, [str(replacement)]) == 0
+    assert vectors.http.request("POST", legacy_path + "/points", get_points)["result"] == []
     assert str(foreign_document) not in {
         hit["document_id"] for hit in query(hybrid_environment, owner, term)
     }
@@ -650,10 +679,10 @@ def test_hybrid_rejects_forged_lexical_point_after_rechecking_postgresql(environ
             "text_version_id": str(foreign_version),
         },
     }
-    monkeypatch.setattr(QdrantBm25, "query", lambda *args: [forged])
-    assert query((engine, hybrid, embeddings, vectors), owner) == [
-        {**hit, "score": pytest.approx(1 / 61)} for hit in query(environment, owner)
-    ]
+    legitimate = vectors.query(owner, embeddings.embed(["synthetic"])[0], [str(generation)], 5)
+    monkeypatch.setattr(QdrantHybrid, "query_hybrid", lambda *args: [forged, *legitimate])
+    hits = query((engine, hybrid, embeddings, vectors), owner)
+    assert len(hits) == 1 and hits[0]["chunk_id"] == legitimate[0]["payload"]["chunk_id"]
 
 
 def extract_synthetic_report(report, directory):
@@ -674,6 +703,84 @@ def extract_synthetic_report(report, directory):
     return result
 
 
+def test_hybrid_mixed_language_terms_and_cross_language_retrieval(environment, tmp_path):
+    engine, settings, _, vectors = environment
+    assert vectors.http.request("GET", "/")["version"] == "1.15.5"
+    settings = settings.model_copy(
+        update={
+            "rag_collection": f"medical_ai_personal_test_ru_en_{uuid4().hex}",
+            "rag_retrieval_mode": "hybrid",
+            # Keep these jobs out of backfills against other synthetic collections.
+            "rag_chunk_chars": settings.rag_chunk_chars + 1,
+        }
+    )
+    vectors = QdrantVectors(settings)
+    embeddings = OllamaEmbeddings(settings)
+    hybrid = QdrantHybrid(vectors)
+    hybrid.ensure()
+    reports = {
+        "glucose": (
+            "Учебный отчёт. Glycated hemoglobin (HbA1c): average blood glucose "
+            "over the past three months."
+        ),
+        "thyroid": "Анализ щитовидной железы. Thyroid-stimulating hormone (TSH).",
+        "genetics": "Синтетическая панель: BRCA1, BRAF V600E, MAP2K1 и c.68_69delAG.",
+    }
+    owner = None
+    documents = {}
+    generations = []
+    for label, content in reports.items():
+        result = extract_synthetic_report(
+            {"id": label, "format": "docx", "text": content},
+            tmp_path,
+        )
+        assert result["text"].strip() == content
+        owner, document, _, job_id = seed(
+            engine, owner, result["text"], format_="docx", locators=result["locators"]
+        )
+        documents[label] = str(document)
+        generations.append(str(index((engine, settings, embeddings, vectors), job_id)))
+    scoped = generation_filter(settings, owner, generations)
+
+    def lexical(query_text):
+        return hybrid.http.request(
+            "POST",
+            hybrid.path + "/points/query",
+            {
+                "query": bm25(query_text),
+                "using": "bm25",
+                "filter": scoped,
+                "with_payload": True,
+            },
+        )["result"]["points"]
+
+    for term, label in (
+        ("Find hba1c", "glucose"),
+        ("Где указан TSH?", "thyroid"),
+        ("BRCA1", "genetics"),
+        ("BRAF V600E", "genetics"),
+        ("MAP2K1", "genetics"),
+        ("c.68_69delAG", "genetics"),
+        ("щитовидной", "thyroid"),
+    ):
+        hits = lexical(term)
+        assert hits and hits[0]["payload"]["document_id"] == documents[label], term
+    assert lexical("c.68_69delAC") == []
+    assert lexical("68_69delAG") == []
+
+    russian_query = "Где указан гликированный гемоглобин?"
+    assert lexical(russian_query) == []
+    dense = vectors.query(owner, embeddings.embed([russian_query])[0], generations, 3)
+    assert dense[0]["payload"]["document_id"] == documents["glucose"]
+    for query_text in ("Find HbA1c", russian_query):
+        with Session(engine) as db:
+            hits = search(
+                db, owner, query_text, 3, settings, embeddings, vectors, require_hybrid=True
+            )
+        assert hits[0]["document_id"] == documents["glucose"]
+        assert "(HbA1c)" in hits[0]["text"] and hits[0]["sources"]
+
+
 def evaluation_summary(dataset, rankings, durations, k):
     queries = dataset["queries"]
     assert len(queries) == len(rankings)
@@ -689,14 +796,17 @@ def evaluation_summary(dataset, rankings, durations, k):
     false_matches = {}
     for category in ("numeric", "date"):
         cases = [
-            (ranking, set(example["decoys"]))
+            (ranking, set(example["decoys"]), example["relevance"])
             for example, ranking in zip(queries, rankings, strict=True)
             if example["category"] == category
         ]
         false_matches[category] = {
             "queries": len(cases),
-            "decoy_top1_rate": mean(bool(set(ranking[:1]) & decoys) for ranking, decoys in cases),
-            "decoy_at_k_rate": mean(bool(set(ranking) & decoys) for ranking, decoys in cases),
+            "decoy_top1_rate": mean(bool(set(r[:1]) & decoys) for r, decoys, _ in cases),
+            "decoy_at_k_rate": mean(bool(set(r) & decoys) for r, decoys, _ in cases),
+            "relevant_top1_rate": mean(
+                bool(r and relevance.get(r[0], 0)) for r, _, relevance in cases
+            ),
         }
     return {
         **{name: mean(score[name] for score in grades) for name in ("recall", "mrr", "ndcg")},
@@ -744,6 +854,7 @@ def test_hybrid_retrieval_evaluation(environment, tmp_path):
         owners[tenant] = owner
         labels[str(document)] = report["id"], tenant
         index((engine, hybrid, embeddings, vectors), job_id)
+    assert backfill(engine, hybrid, vectors)[0] == len(dataset["documents"])
 
     def retrieve(mode, example, k):
         tenant = example["tenant"]
@@ -804,21 +915,55 @@ def test_hybrid_retrieval_evaluation(environment, tmp_path):
         verdict = "mixed_ranking_results"
     else:
         verdict = "ranking_gain_on_this_fixture"
-    print(
-        json.dumps(
-            {
-                "dataset": dataset["version"],
-                "model": settings.rag_embedding_model,
-                "digest": digest,
-                "dimensions": settings.rag_embedding_dimensions,
-                "chunk_chars": settings.rag_chunk_chars,
-                "chunk_overlap": settings.rag_chunk_overlap,
-                "qdrant": qdrant,
-                "latency_repeats": repeats,
-                "cutoffs": output,
-                "hybrid_minus_dense": deltas,
-                "ranking_verdict": verdict,
-            },
-            sort_keys=True,
-        )
-    )
+    run_config = {
+        "dataset": dataset["version"],
+        "model": settings.rag_embedding_model,
+        "digest": digest,
+        "dimensions": settings.rag_embedding_dimensions,
+        "chunk_chars": settings.rag_chunk_chars,
+        "chunk_overlap": settings.rag_chunk_overlap,
+        "qdrant": qdrant,
+        "latency_repeats": repeats,
+    }
+    report = {
+        **run_config,
+        "hybrid_index": "hybrid_v2",
+        "cutoffs": output,
+        "hybrid_minus_dense": deltas,
+        "ranking_verdict": verdict,
+    }
+    baseline_path = os.environ.get("RAG_EVALUATION_BASELINE")
+    if baseline_path:
+        baseline = json.loads(Path(baseline_path).read_text(encoding="utf-8"))
+        assert all(baseline.get(key) == value for key, value in run_config.items())
+        assert baseline.get("hybrid_index") is None, "Expected the previous Hybrid RAG report"
+        comparison = {}
+        queries = dataset["queries"]
+        for k, by_mode in output.items():
+            previous = baseline["cutoffs"][str(k)]["hybrid"]
+            previous_top1 = {
+                query_id: next(iter(ranking), "")
+                for query_id, ranking in previous["per_query"].items()
+            }
+            current = by_mode["hybrid"]
+            comparison[k] = {
+                **{metric: current[metric] - previous[metric] for metric in deltas[k]},
+                "false_matches": {
+                    category: {
+                        metric: stats[metric] - previous["false_matches"][category][metric]
+                        for metric in ("decoy_top1_rate", "decoy_at_k_rate")
+                    }
+                    for category, stats in current["false_matches"].items()
+                },
+                "relevant_top1_rate": {
+                    category: current["false_matches"][category]["relevant_top1_rate"]
+                    - mean(
+                        bool(example["relevance"].get(previous_top1[example["id"]]))
+                        for example in queries
+                        if example["category"] == category
+                    )
+                    for category in ("numeric", "date")
+                },
+            }
+        report["hybrid_minus_previous_hybrid"] = comparison
+    print(json.dumps(report, sort_keys=True))

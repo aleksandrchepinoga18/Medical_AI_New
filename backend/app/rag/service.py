@@ -1,6 +1,5 @@
 import logging
 import math
-from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid5
@@ -12,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.documents.models import Document, DocumentTextVersion
 from app.rag.adapters import OllamaEmbeddings, QdrantVectors, RagError, fingerprint
-from app.rag.hybrid import QdrantBm25, rrf
+from app.rag.hybrid import QdrantHybrid
 from app.rag.models import RagChunk, RagIndexJob
 
 logger = logging.getLogger(__name__)
@@ -98,26 +97,22 @@ def search(
     expected = sum(job.chunk_count for job in jobs)
     # End the session snapshot before the remote call; revalidate all hits afterwards.
     db.commit()
-    lexical = None
+    vector = embeddings.embed([query])[0]
     if settings.rag_retrieval_mode == "hybrid":
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            bm25 = executor.submit(
-                QdrantBm25(vectors).query, user_id, query, generations, expected, k
+        try:
+            hits = QdrantHybrid(vectors).query_hybrid(
+                user_id, vector, query, generations, expected, k
             )
-            dense = vectors.query(user_id, embeddings.embed([query])[0], generations, k)
-            try:
-                lexical = bm25.result()
-            except (RagError, KeyError, TypeError, AttributeError) as error:
-                code = error.code if isinstance(error, RagError) else "INVALID_BM25_RESPONSE"
-                if require_hybrid:
-                    raise RagError(code) from None
-                if code != "BM25_NO_TERMS":
-                    logger.warning("rag_bm25_fallback code=%s", code)
+        except RagError as error:
+            if require_hybrid:
+                raise
+            logger.warning("rag_hybrid_fallback code=%s", error.code)
+            hits = vectors.query(user_id, vector, generations, k)
     else:
-        dense = vectors.query(user_id, embeddings.embed([query])[0], generations, k)
+        hits = vectors.query(user_id, vector, generations, k)
     db.expire_all()
     candidate_generations = {
-        str(hit.get("payload", {}).get("generation")) for hit in (dense + (lexical or []))
+        str(hit.get("payload", {}).get("generation")) for hit in hits
     } & set(generations)
     if not candidate_generations:
         return []
@@ -137,10 +132,7 @@ def search(
         RagIndexJob.generation.in_([UUID(value) for value in candidate_generations]),
     )
     current = {str(job.generation): job for job in db.scalars(current_query)}
-    dense_items = materialize_hits(db, user_id, dense, current)
-    if lexical is None:
-        return dense_items
-    return rrf(dense_items, materialize_hits(db, user_id, lexical, current), k=k)
+    return materialize_hits(db, user_id, hits, current)
 
 
 def materialize_hits(

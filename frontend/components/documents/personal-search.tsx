@@ -54,7 +54,7 @@ export function PersonalSearch() {
       <p className="mt-2 text-xs text-muted-foreground">{hit.sources.map(source =>
         <Link key={`${source.kind}-${source.index}`} href={source.url ?? hit.source_url}
           className="mr-2 underline">{source.kind === "page" ? "Страница" : "Блок"} {source.index}</Link>)}
-        {` · Сходство: ${hit.score.toFixed(3)}`}</p>
+        {` · Балл поиска: ${hit.score.toFixed(3)}`}</p>
       <p className="mt-3 whitespace-pre-wrap break-words text-sm leading-7">{hit.text}</p>
     </li>)}</ol>
   </main>;

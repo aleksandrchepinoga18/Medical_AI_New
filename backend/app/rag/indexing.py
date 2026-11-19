@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.documents.models import Document, DocumentTextVersion
 from app.rag.adapters import OllamaEmbeddings, QdrantVectors, RagError, fingerprint
-from app.rag.bm25_index import sync_published
+from app.rag.bm25_index import delete_copies, sync_published
 from app.rag.chunking import chunk_text
 from app.rag.models import RagChunk, RagIndexJob
 from app.rag.service import latest_version
@@ -227,6 +227,8 @@ def _process_index(
             except RagError as error:
                 if operation != "delete" or error.code != "HTTP_404":
                     raise
+            if operation == "delete":
+                delete_copies(vectors, user_id, document_id)
             check_deadline()
             job.status = "ready" if operation == "index" else "deleted"
             job.generation = token if operation == "index" else None
@@ -251,10 +253,8 @@ def _process_index(
                 retry_or_fail(job, settings, code)
                 db.commit()
         return
-    if settings.rag_retrieval_mode == "hybrid":
-        sync_published(
-            engine, settings, vectors, user_id, document_id, version_id, operation, token
-        )
+    if operation == "index":
+        sync_published(engine, settings, vectors, user_id, document_id, token)
 
 
 def process_index_task(job_id: str, token: str) -> None:

@@ -214,6 +214,14 @@ class QdrantVectors:
             raise RagError("COLLECTION_DIMENSION_MISMATCH")
         return dict(result)
 
+    def schema(self) -> dict[str, Any]:
+        return {
+            "vectors": {
+                "size": self.settings.rag_embedding_dimensions,
+                "distance": "Cosine",
+            },
+        }
+
     def ensure(self) -> None:
         try:
             info = self.inspect()
@@ -221,18 +229,9 @@ class QdrantVectors:
             if error.code != "HTTP_404":
                 raise
             try:
-                self.http.request(
-                    "PUT",
-                    self.path,
-                    {
-                        "vectors": {
-                            "size": self.settings.rag_embedding_dimensions,
-                            "distance": "Cosine",
-                        },
-                    },
-                )
+                self.http.request("PUT", self.path, self.schema())
             except RagError as conflict:
-                if conflict.code != "HTTP_409":
+                if conflict.code not in {"HTTP_400", "HTTP_409"}:
                     raise
             info = self.inspect()
         ensure_payload_indexes(self.http, self.path, info)
