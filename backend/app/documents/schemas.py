@@ -8,6 +8,7 @@ class DocumentView(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
+    document_number: int
     original_filename: str
     format: str
     size_bytes: int
@@ -18,8 +19,12 @@ class DocumentView(BaseModel):
     updated_at: datetime
 
 
+class DocumentListItem(DocumentView):
+    index_status: str
+
+
 class DocumentList(BaseModel):
-    items: list[DocumentView]
+    items: list[DocumentListItem]
     total: int
     offset: int
     limit: int

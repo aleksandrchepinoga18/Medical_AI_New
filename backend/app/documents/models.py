@@ -9,6 +9,7 @@ from sqlalchemy import (
     BigInteger,
     CheckConstraint,
     DateTime,
+    FetchedValue,
     ForeignKey,
     Index,
     Integer,
@@ -52,12 +53,15 @@ class Document(Base):
         ),
         UniqueConstraint("object_key", name="uq_documents_object_key"),
         UniqueConstraint("owner_id", "idempotency_key", name="uq_documents_owner_request"),
+        UniqueConstraint("owner_id", "document_number", name="uq_documents_owner_number"),
+        CheckConstraint("document_number > 0", name="ck_documents_number_positive"),
         Index("ix_documents_owner_created_id", "owner_id", "created_at", "id"),
         Index("ix_documents_owner_sha256", "owner_id", "sha256"),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     owner_id: Mapped[UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    document_number: Mapped[int] = mapped_column(BigInteger, server_default=FetchedValue())
     original_filename: Mapped[str] = mapped_column(String(255))
     format: Mapped[str] = mapped_column(String(8))
     size_bytes: Mapped[int] = mapped_column(BigInteger)

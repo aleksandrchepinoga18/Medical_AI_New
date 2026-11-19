@@ -239,8 +239,10 @@ def test_context_budget_and_metadata():
         "sources": [{"kind": "page", "index": 2}],
         "text_version_id": "version",
     }
-    context, citations = build_context([hit, hit], 10)
-    assert context == [hit["text"][:10]]
+    assert build_context([hit], 10) == ([], [])
+    context, citations = build_context([hit, hit], 100)
+    assert context == [hit["text"]]
+    assert len(citations) == 1
     assert citations[0]["source_url"] == hit["source_url"]
     assert "text" not in citations[0]
     assert build_context([], 100) == ([], [])

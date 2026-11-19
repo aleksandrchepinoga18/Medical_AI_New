@@ -1,15 +1,16 @@
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from contextlib import asynccontextmanager
+from datetime import date
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import quote
 from uuid import UUID
 
 from anyio import CancelScope
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from python_multipart.exceptions import MultipartParseError
-from sqlalchemy import func, select
+from sqlalchemy import ColumnElement, Date, cast, func, or_, select
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import FormData, UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
@@ -19,7 +20,13 @@ from starlette.types import Receive, Scope, Send
 from app.auth.routes import DB, AuthenticatedUser
 from app.db import get_settings
 from app.documents.models import Document, DocumentTextVersion
-from app.documents.schemas import DocumentDetails, DocumentList, DocumentView, TextVersionView
+from app.documents.schemas import (
+    DocumentDetails,
+    DocumentList,
+    DocumentListItem,
+    DocumentView,
+    TextVersionView,
+)
 from app.documents.service import create_upload, owned_document, retry_document
 from app.integrations.object_storage import (
     CONTENT_TYPES,
@@ -27,6 +34,8 @@ from app.integrations.object_storage import (
     OriginalNotFound,
     StorageError,
 )
+from app.rag.models import RagIndexJob
+from app.rag.service import index_state
 
 
 def require_session_cookie(request: Request) -> None:
@@ -173,20 +182,62 @@ def list_documents(
     db: DB,
     limit: Annotated[int, Query(ge=1, le=100)] = 25,
     offset: Annotated[int, Query(ge=0, le=100000)] = 0,
+    q: Annotated[str, Query(max_length=255)] = "",
+    sort: Literal["number", "name", "date"] = "date",
+    direction: Literal["asc", "desc"] = "desc",
 ) -> DocumentList:
     response.headers["Cache-Control"] = "no-store"
+    settings = get_settings()
+    filters: list[ColumnElement[bool]] = [Document.owner_id == user.id]
+    term = q.strip()
+    if term:
+        terms = [Document.original_filename.icontains(term, autoescape=True)]
+        digits = term.removeprefix("№").strip()
+        if digits.isascii() and digits.isdecimal() and len(digits) <= 18:
+            terms.append(Document.document_number == int(digits))
+        try:
+            uploaded_on = date.fromisoformat(term)
+        except ValueError:
+            pass
+        else:
+            local_date = cast(func.timezone("Europe/Moscow", Document.created_at), Date)
+            terms.append(local_date == uploaded_on)
+        filters.append(or_(*terms))
     total = db.scalar(
-        select(func.count()).select_from(Document).where(Document.owner_id == user.id)
+        select(func.count()).select_from(Document).where(*filters)
     )
-    documents = db.scalars(
-        select(Document)
-        .where(Document.owner_id == user.id)
-        .order_by(Document.created_at.desc(), Document.id.desc())
+    latest = (
+        select(DocumentTextVersion.id)
+        .where(DocumentTextVersion.document_id == Document.id)
+        .order_by(DocumentTextVersion.version.desc())
+        .limit(1)
+        .correlate(Document)
+        .scalar_subquery()
+    )
+    column = {
+        "number": Document.document_number,
+        "name": func.lower(Document.original_filename),
+        "date": Document.created_at,
+    }[sort]
+    documents = db.execute(
+        select(Document, RagIndexJob)
+        .outerjoin(
+            RagIndexJob,
+            (RagIndexJob.text_version_id == latest) & (RagIndexJob.user_id == user.id),
+        )
+        .where(*filters)
+        .order_by(column.asc() if direction == "asc" else column.desc(), Document.id.desc())
         .offset(offset)
         .limit(limit)
     )
     return DocumentList(
-        items=[DocumentView.model_validate(doc) for doc in documents],
+        items=[
+            DocumentListItem(
+                **DocumentView.model_validate(doc).model_dump(),
+                index_status=index_state(doc, job, settings),
+            )
+            for doc, job in documents
+        ],
         total=total or 0,
         offset=offset,
         limit=limit,

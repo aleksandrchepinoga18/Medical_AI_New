@@ -7,8 +7,10 @@ import { Download, FileText, FolderOpen, Plus, RefreshCw, ShieldCheck } from "lu
 import { Button } from "../ui/button";
 import { Card } from "../ui/card";
 import { StatusBadge } from "./status-badge";
-import { activeStatuses, canDownload, canRetry, DocumentApiError, downloadDocument, listDocuments,
-  processingMessage, retryDocument, type DocumentPage } from "../../lib/documents-api";
+import { activeIndexStatuses, activeStatuses, canDownload, canRetry, DocumentApiError,
+  downloadDocument, indexStatusNames, listDocuments, processingMessage, retryDocument,
+  type DocumentOrder, type DocumentPage } from "../../lib/documents-api";
+import { Input } from "../ui/input";
 
 export function DocumentList() {
   const router = useRouter();
@@ -17,16 +19,21 @@ export function DocumentList() {
   const [refresh, setRefresh] = useState(0);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+  const [query, setQuery] = useState("");
+  const [sort, setSort] = useState<DocumentOrder>("date");
+  const [direction, setDirection] = useState<"asc" | "desc">("desc");
   useEffect(() => {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     async function load() {
       try {
-        const result = await listDocuments(offset, controller.signal);
+        const result = await listDocuments(offset, controller.signal, query, sort, direction);
         if (controller.signal.aborted) return;
         setData(result);
         setError("");
-        if (result.items.some(item => activeStatuses.has(item.status))) timer = setTimeout(load, 4000);
+        if (result.items.some(item => activeStatuses.has(item.status)
+          || activeIndexStatuses.has(item.index_status ?? ""))) timer = setTimeout(load, 4000);
       } catch (failure) {
         if (controller.signal.aborted) return;
         if (failure instanceof DocumentApiError && failure.status === 401) router.replace("/login");
@@ -35,7 +42,7 @@ export function DocumentList() {
     }
     void load();
     return () => { controller.abort(); if (timer) clearTimeout(timer); };
-  }, [offset, refresh, router]);
+  }, [direction, offset, query, refresh, router, sort]);
 
   async function action(id: string, task: () => Promise<unknown>) {
     setBusy(id);
@@ -64,19 +71,45 @@ export function DocumentList() {
       <div className="flex items-center justify-between border-b border-border px-6 py-4">
         <h2 className="font-semibold">Мои документы</h2><Button variant="ghost" size="sm" onClick={() => setRefresh(value => value + 1)}><RefreshCw />Обновить</Button>
       </div>
+      <form className="flex flex-wrap items-end gap-3 border-b px-6 py-4"
+        onSubmit={event => { event.preventDefault(); setOffset(0); setQuery(draft.trim()); }}>
+        <label className="min-w-52 flex-1 text-sm">Поиск по номеру, имени или дате
+          <Input className="mt-1" value={draft} maxLength={255} placeholder="№ 2, имя или ГГГГ-ММ-ДД"
+            onChange={event => setDraft(event.target.value)} />
+        </label>
+        <Button type="submit" variant="outline">Найти</Button>
+        <label className="text-sm">Сортировка
+          <select className="mt-1 block rounded-md border bg-background p-2" value={sort}
+            onChange={event => { setOffset(0); setSort(event.target.value as DocumentOrder); }}>
+            <option value="number">По номеру</option><option value="name">По имени</option>
+            <option value="date">По дате</option>
+          </select>
+        </label>
+        <label className="text-sm">Порядок
+          <select className="mt-1 block rounded-md border bg-background p-2" value={direction}
+            onChange={event => { setOffset(0); setDirection(event.target.value === "asc" ? "asc" : "desc"); }}>
+            <option value="asc">По возрастанию</option><option value="desc">По убыванию</option>
+          </select>
+        </label>
+      </form>
       {!data && !error && <p role="status" className="p-10 text-center text-muted-foreground">Загружаем список…</p>}
-      {data?.items.length === 0 && <div className="px-6 py-16 text-center"><FolderOpen className="mx-auto mb-4 size-12 text-primary/50" />
+      {data?.items.length === 0 && query && <p className="p-10 text-center">Документы не найдены.</p>}
+      {data?.items.length === 0 && !query && <div className="px-6 py-16 text-center"><FolderOpen className="mx-auto mb-4 size-12 text-primary/50" />
         <h3 className="text-lg font-medium">Здесь появятся ваши документы</h3><p className="mx-auto mb-6 mt-2 max-w-sm text-sm text-muted-foreground">Загрузите первый PDF или DOCX, чтобы сохранить оригинал и извлечь текст.</p>
         <Button asChild variant="outline"><Link href="/documents/upload">Выбрать документ</Link></Button></div>}
       {data && data.items.length > 0 && <div className="overflow-x-auto"><table className="w-full text-left text-sm">
-        <thead className="bg-muted/50 text-xs text-muted-foreground"><tr><th className="px-6 py-3 font-medium">Документ</th><th className="px-4 py-3 font-medium">Статус</th><th className="hidden px-4 py-3 font-medium lg:table-cell">Добавлен</th><th className="px-6 py-3 text-right font-medium">Действия</th></tr></thead>
+        <thead className="bg-muted/50 text-xs text-muted-foreground"><tr><th className="px-6 py-3 font-medium">Документ</th><th className="px-4 py-3 font-medium">Извлечение и индекс</th><th className="px-4 py-3 font-medium">Добавлен</th><th className="px-6 py-3 text-right font-medium">Действия</th></tr></thead>
         <tbody className="divide-y divide-border">{data.items.map(item => <tr key={item.id} className="hover:bg-muted/30">
           <td className="max-w-xs px-6 py-5"><Link href={`/documents/${item.id}`} className="flex items-center gap-3 hover:text-primary"><span className="rounded-lg border border-border bg-background p-2 text-primary"><FileText className="size-5" /></span>
-            <span className="min-w-0"><span className="block truncate font-medium">{item.original_filename}</span><span className="mt-1 block text-xs text-muted-foreground">{item.format.toUpperCase()} · {(item.size_bytes / 1024).toFixed(1)} КБ</span></span></Link>
+            <span className="min-w-0"><span className="block truncate font-medium">№ {item.document_number} · {item.original_filename}</span><span className="mt-1 block text-xs text-muted-foreground">{item.format.toUpperCase()} · {(item.size_bytes / 1024).toFixed(1)} КБ</span></span></Link>
             {item.error_code && <p className="mt-2 max-w-xs text-xs text-muted-foreground">{processingMessage(item.error_code)}</p>}</td>
-          <td className="px-4 py-5"><StatusBadge status={item.status} /></td>
-          <td className="hidden whitespace-nowrap px-4 py-5 text-muted-foreground lg:table-cell">{new Date(item.created_at).toLocaleDateString("ru-RU")}</td>
+          <td className="px-4 py-5"><StatusBadge status={item.status} />
+            <p className="mt-1 text-xs text-muted-foreground">{indexStatusNames[item.index_status ?? ""] ?? "—"}</p>
+          </td>
+          <td className="whitespace-nowrap px-4 py-5 text-muted-foreground">{new Date(item.created_at).toLocaleDateString("ru-RU", { timeZone: "Europe/Moscow" })}</td>
           <td className="px-6 py-5"><div className="flex justify-end gap-1">
+            <Button asChild variant="ghost" size="icon"><Link aria-label={`Текст документа № ${item.document_number}`}
+              href={`/documents/${item.id}#extracted-text`}><FileText /></Link></Button>
             <Button variant="ghost" size="icon" aria-label={`Скачать ${item.original_filename}`} disabled={busy !== null || !canDownload(item)}
               onClick={() => action(item.id, () => downloadDocument(item.id, item.original_filename))}><Download /></Button>
             {canRetry(item) && <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => action(item.id, () => retryDocument(item.id))}><RefreshCw />Повторить</Button>}

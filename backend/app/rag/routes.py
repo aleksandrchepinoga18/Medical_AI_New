@@ -9,9 +9,9 @@ from app.auth.routes import DB, AuthenticatedUser
 from app.db import get_settings
 from app.documents.models import Document
 from app.documents.routes import require_session_cookie
-from app.rag.adapters import OllamaEmbeddings, QdrantVectors, RagError, fingerprint
+from app.rag.adapters import OllamaEmbeddings, QdrantVectors, RagError
 from app.rag.models import RagIndexJob
-from app.rag.service import enqueue, latest_version, request_operation, search
+from app.rag.service import enqueue, index_state, latest_version, request_operation, search
 
 router = APIRouter(
     prefix="/rag",
@@ -95,13 +95,8 @@ def index_status(
             "operation": "index",
             "text_version_id": None,
         }
-    status = job.status
-    if status == "ready" and job.fingerprint != fingerprint(get_settings()):
-        status = "outdated"
-    if document.status != "ready" and job.operation == "index":
-        status = "unavailable"
     return {
-        "status": status,
+        "status": index_state(document, job, get_settings()),
         "attempts": job.attempts,
         "chunk_count": job.chunk_count,
         "error_code": job.error_code,

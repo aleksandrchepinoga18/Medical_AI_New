@@ -91,7 +91,7 @@ export function PersonalChat() {
             <p className="whitespace-pre-wrap">{m.content}</p>
             {m.status !== "complete" && <p>Попытка: {m.status}</p>}
             {m.sources.map((s, i) => <div key={i}>
-              <a className="underline" href={s.source_url}>{s.filename}</a>
+              <a className="underline" href={s.source_url}>{s.document_number !== undefined && `№ ${s.document_number} · `}{s.filename}</a>
               {s.sources.map((p, j) => <span key={j}> · {p.kind} {p.index}</span>)}
             </div>)}
           </article>)}

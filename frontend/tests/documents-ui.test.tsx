@@ -21,7 +21,8 @@ vi.mock("../lib/documents-api", async importOriginal => ({
 }));
 
 const item = {
-  id: "synthetic-id", original_filename: "synthetic.pdf", format: "pdf", size_bytes: 123,
+  id: "synthetic-id", document_number: 7, index_status: "ready",
+  original_filename: "synthetic.pdf", format: "pdf", size_bytes: 123,
   sha256: "0".repeat(64), status: "failed", error_code: "PROCESSING_TIMEOUT",
   created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
 };
@@ -54,6 +55,20 @@ it("redirects an expired session", async () => {
   mocks.list.mockRejectedValue(new DocumentApiError(401));
   render(<DocumentList />);
   await waitFor(() => expect(mocks.router.replace).toHaveBeenCalledWith("/login"));
+});
+
+it("shows the persistent number and searches the server with the selected order", async () => {
+  mocks.list.mockResolvedValue({ items: [item], total: 1, offset: 0, limit: 25 });
+  render(<DocumentList />);
+  expect(await screen.findByText("№ 7 · synthetic.pdf")).toBeInTheDocument();
+  expect(screen.getByText("Индекс готов")).toBeInTheDocument();
+  const user = userEvent.setup();
+  await user.type(screen.getByLabelText("Поиск по номеру, имени или дате"), "№ 7");
+  await user.click(screen.getByRole("button", { name: "Найти" }));
+  await user.selectOptions(screen.getByLabelText("Сортировка"), "number");
+  await waitFor(() => expect(mocks.list).toHaveBeenLastCalledWith(
+    0, expect.any(AbortSignal), "№ 7", "number", "desc",
+  ));
 });
 
 it("keeps the same upload key after a network failure", async () => {

@@ -1,4 +1,4 @@
-export type Citation = { document_id: string; filename: string; source_url: string;
+export type Citation = { document_id: string; document_number?: number; filename: string; source_url: string;
   sources: { kind: string; index: number }[] };
 export type ChatMessage = { id: string; role: string; content: string; status: string;
   sources: Citation[] };

@@ -1,5 +1,6 @@
 export type DocumentItem = {
-  id: string; original_filename: string; format: string; size_bytes: number; sha256: string;
+  id: string; document_number: number; original_filename: string; format: string;
+  size_bytes: number; sha256: string; index_status?: string;
   status: string; error_code: string | null; created_at: string; updated_at: string;
 };
 export type DocumentPage = { items: DocumentItem[]; total: number; offset: number; limit: number };
@@ -31,8 +32,13 @@ async function csrf(): Promise<string> {
   return (await response.json()).csrf_token;
 }
 
-export async function listDocuments(offset: number, signal?: AbortSignal): Promise<DocumentPage> {
-  return (await checked(await fetch(`/api/documents?offset=${offset}&limit=25`, {
+export type DocumentOrder = "number" | "name" | "date";
+
+export async function listDocuments(offset: number, signal?: AbortSignal,
+  query = "", sort: DocumentOrder = "date", direction: "asc" | "desc" = "desc",
+): Promise<DocumentPage> {
+  const params = new URLSearchParams({ offset: String(offset), limit: "25", q: query, sort, direction });
+  return (await checked(await fetch(`/api/documents?${params}`, {
     cache: "no-store", signal,
   }))).json();
 }
@@ -79,6 +85,13 @@ export const statusNames: Record<string, string> = {
   ready: "Готов", failed: "Ошибка", needs_ocr: "Нужен OCR",
 };
 export const activeStatuses = new Set(["uploading", "queued", "processing"]);
+export const activeIndexStatuses = new Set(["pending", "published", "processing"]);
+export const indexStatusNames: Record<string, string> = {
+  disabled: "Поиск выключен", not_indexed: "Индекс отсутствует", pending: "Индекс в очереди",
+  published: "Индекс в очереди", processing: "Индексация", ready: "Индекс готов",
+  failed: "Ошибка индексации", deleted: "Индекс удалён", outdated: "Индекс устарел",
+  unavailable: "Индекс недоступен",
+};
 export function processingMessage(code: string | null): string {
   if (!code) return "";
   const messages: Record<string, string> = {

@@ -1,29 +1,35 @@
 """Explicitly enabled against the isolated document test Compose only; no table cleanup."""
 
+import importlib.util
 import os
 import time
 from collections.abc import Iterator
-from datetime import UTC, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
+from threading import Barrier
 from uuid import UUID, uuid4
 
 import pymupdf
 import pytest
 from alembic.config import Config
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from docx import Document as DocxDocument
 from fastapi.testclient import TestClient
 from minio import Minio
-from sqlalchemy import Engine, create_engine, func, select
+from sqlalchemy import Engine, create_engine, delete, func, select, text
 from sqlalchemy.orm import Session
 
 from alembic import command
 from app.core.config import Settings
 from app.db import database_url, get_db, get_settings
 from app.documents import processing
-from app.documents.models import DocumentIngestionJob, DocumentTextVersion
+from app.documents.models import Document, DocumentIngestionJob, DocumentTextVersion
 from app.documents.processing import ExtractionResult, process_job
 from app.documents.routes import get_storage
+from app.documents.service import create_upload
 from app.integrations.object_storage import ObjectStorage, StorageError
 from app.main import app
 from app.workers.ingestion_dispatcher import dispatch_once
@@ -128,6 +134,79 @@ def due_job(engine: Engine, document_id: str) -> UUID:
         job.available_at = PAST
         db.commit()
         return job.id
+
+
+def test_number_migration_backfills_in_upload_order_without_rewriting_ids(environment):
+    engine, _, _ = environment
+    schema = "number_migration_" + uuid4().hex
+    path = Path(__file__).parents[1] / "alembic/versions/0005_document_numbers.py"
+    spec = importlib.util.spec_from_file_location("numbers_migration", path)
+    assert spec and spec.loader
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    with engine.connect() as connection, connection.begin() as transaction:
+        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        connection.execute(text(f'SET LOCAL search_path TO "{schema}"'))
+        connection.execute(text("CREATE TABLE users (id int PRIMARY KEY)"))
+        connection.execute(text(
+            "CREATE TABLE documents (id int PRIMARY KEY, owner_id int REFERENCES users(id), "
+            "created_at timestamptz NOT NULL)"
+        ))
+        connection.execute(text("INSERT INTO users VALUES (1), (2), (3)"))
+        connection.execute(text("""
+            INSERT INTO documents VALUES (23, 1, '2025-01-02'), (22, 1, '2025-01-01'),
+            (21, 1, '2025-01-01'), (24, 2, '2025-01-01')
+        """))
+        with Operations.context(MigrationContext.configure(connection)):
+            migration.upgrade()
+        assert connection.execute(text(
+            "SELECT id, document_number FROM documents ORDER BY id"
+        )).all() == [(21, 1), (22, 2), (23, 3), (24, 1)]
+        assert connection.execute(text(
+            "INSERT INTO documents (id, owner_id, created_at) VALUES (25, 1, now()),"
+            " (26, 3, now()) RETURNING document_number"
+        )).scalars().all() == [4, 1]
+        transaction.rollback()
+
+
+def test_number_allocation_parallel_uploads_and_deletion(client, environment):
+    engine, storage, settings = environment
+    owner = UUID(client.get("/auth/me").json()["id"])
+    barrier = Barrier(2)
+    payload = pdf_bytes()
+
+    def create(name, request_key):
+        with Session(engine) as db:
+            row = create_upload(
+                db, owner, BytesIO(payload), name, request_key, settings, storage
+            )
+            return row.id, row.document_number
+
+    def parallel_create(name, key):
+        barrier.wait(timeout=10)
+        return create(name, key)
+
+    first_key, second_key = uuid4(), uuid4()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(parallel_create, "one.pdf", first_key)
+        second = pool.submit(parallel_create, "two.pdf", second_key)
+        numbers = [first.result(), second.result()]
+    assert {number for _, number in numbers} == {1, 2}
+    assert create("one.pdf", first_key) == numbers[0]
+    highest = next(doc_id for doc_id, number in numbers if number == 2)
+    with Session(engine) as db:
+        db.execute(delete(DocumentIngestionJob).where(DocumentIngestionJob.document_id == highest))
+        db.execute(delete(Document).where(Document.id == highest))
+        db.commit()
+    newest = create("reuploaded.pdf", uuid4())
+    assert newest[1] == 3
+    page = client.get("/documents", params={"sort": "number", "direction": "asc"}).json()
+    assert [row["document_number"] for row in page["items"]] == [1, 3]
+    uploaded_at = datetime.fromisoformat(page["items"][1]["created_at"])
+    uploaded_date = uploaded_at.astimezone(timezone(timedelta(hours=3))).date().isoformat()
+    for query in ("№ 3", "REUPLOADED", uploaded_date):
+        result = client.get("/documents", params={"q": query}).json()
+        assert any(row["document_number"] == 3 for row in result["items"])
 
 
 def test_owner_isolation_csrf_and_idempotency(client: TestClient, environment, monkeypatch) -> None:

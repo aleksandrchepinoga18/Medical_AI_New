@@ -78,6 +78,20 @@ def request_operation(db: Session, job: RagIndexJob, operation: str) -> None:
     db.commit()
 
 
+def index_state(document: Document, job: RagIndexJob | None, settings: Settings) -> str:
+    if not settings.rag_enabled:
+        return "disabled"
+    if job is None:
+        return "not_indexed"
+    if job.status == "ready" and job.fingerprint != fingerprint(settings):
+        return "outdated"
+    if job.status == "ready" and job.generation is None:
+        return "unavailable"
+    if document.status != "ready" and job.operation == "index":
+        return "unavailable"
+    return job.status
+
+
 def search(
     db: Session,
     user_id: UUID,
@@ -88,8 +102,13 @@ def search(
     vectors: QdrantVectors,
     *,
     require_hybrid: bool = False,
+    include_evidence_metadata: bool = False,
+    only_generation: UUID | None = None,
 ) -> list[dict[str, Any]]:
-    jobs = list(db.scalars(eligible(user_id, settings)))
+    allowed_jobs = eligible(user_id, settings)
+    if only_generation is not None:
+        allowed_jobs = allowed_jobs.where(RagIndexJob.generation == only_generation)
+    jobs = list(db.scalars(allowed_jobs))
     if not jobs:
         return []
     documents_by_generation = {str(job.generation): job.document_id for job in jobs}
@@ -132,7 +151,9 @@ def search(
         RagIndexJob.generation.in_([UUID(value) for value in candidate_generations]),
     )
     current = {str(job.generation): job for job in db.scalars(current_query)}
-    return materialize_hits(db, user_id, hits, current)
+    return materialize_hits(
+        db, user_id, hits, current, include_evidence_metadata=include_evidence_metadata
+    )
 
 
 def materialize_hits(
@@ -140,6 +161,8 @@ def materialize_hits(
     user_id: UUID,
     hits: list[dict[str, Any]],
     current: dict[str, RagIndexJob],
+    *,
+    include_evidence_metadata: bool = False,
 ) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     seen: set[UUID] = set()
@@ -197,6 +220,15 @@ def materialize_hits(
                 ],
                 "filename": document.original_filename,
                 "source_url": f"/documents/{chunk.document_id}#{anchor}",
+                **(
+                    {
+                        "chunk_start": chunk.start_char,
+                        "generation": str(job.generation),
+                        "document_number": document.document_number,
+                    }
+                    if include_evidence_metadata
+                    else {}
+                ),
             }
         )
     return output
