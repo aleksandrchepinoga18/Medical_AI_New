@@ -11,6 +11,7 @@ import { DocumentApiError } from "../lib/documents-api";
 const mocks = vi.hoisted(() => ({
   router: { push: vi.fn(), replace: vi.fn(), refresh: vi.fn() },
   list: vi.fn(), upload: vi.fn(), retry: vi.fn(), download: vi.fn(), details: vi.fn(),
+  authorizeUltra: vi.fn(), refreshExtraction: vi.fn(), downloadExtractedText: vi.fn(),
 }));
 vi.mock("next/navigation", () => ({ useRouter: () => mocks.router }));
 vi.mock("../components/documents/index-panel", () => ({ IndexPanel: () => null }));
@@ -18,6 +19,8 @@ vi.mock("../lib/documents-api", async importOriginal => ({
   ...await importOriginal<typeof import("../lib/documents-api")>(),
   listDocuments: mocks.list, uploadDocument: mocks.upload, retryDocument: mocks.retry,
   downloadDocument: mocks.download, getDocument: mocks.details,
+  authorizeUltra: mocks.authorizeUltra, refreshExtraction: mocks.refreshExtraction,
+  downloadExtractedText: mocks.downloadExtractedText,
 }));
 
 const item = {
@@ -109,4 +112,68 @@ it("renders extracted document text as text rather than HTML", async () => {
   render(<DocumentDetails id="synthetic-id" />);
   expect(await screen.findByText("<script>synthetic</script>")).toBeInTheDocument();
   expect(document.querySelector("script")).toBeNull();
+});
+
+const ready = {
+  ...item, status: "ready", error_code: null, external_extraction_enabled: true,
+  text_version: { version: 2, normalized_text: "Synthetic PDF text", locators: [] },
+};
+
+it("only authorizes the named PDF after affirmative consent", async () => {
+  const job = { job_id: "job", status: "succeeded", error_code: null, text_version: 2 };
+  mocks.details.mockResolvedValue(ready);
+  mocks.authorizeUltra.mockImplementation(async () => {
+    mocks.details.mockResolvedValue({ ...ready, external_extraction: job });
+    return job;
+  });
+  render(<DocumentDetails id={item.id} />);
+  const user = userEvent.setup();
+  const trigger = await screen.findByRole("button", { name: "Обработать через GigaChat Ultra" });
+  await user.click(trigger);
+  const dialog = await screen.findByRole("dialog");
+  expect(dialog).toHaveTextContent("synthetic.pdf");
+  expect(dialog).toHaveTextContent("версия 2");
+  await user.click(screen.getByRole("button", { name: "Отмена" }));
+  expect(mocks.authorizeUltra).not.toHaveBeenCalled();
+  await user.click(trigger);
+  await user.click(await screen.findByRole("button", { name: "Подтвердить передачу PDF" }));
+  expect(mocks.authorizeUltra).toHaveBeenCalledTimes(1);
+  expect(mocks.authorizeUltra).toHaveBeenCalledWith(item.id, item.sha256, 2);
+  expect(await screen.findByText("GigaChat Ultra · Завершено")).toBeInTheDocument();
+});
+
+it("shows reports, separates preview and downloads, and can refresh locally", async () => {
+  const row = {
+    name: "Synthetic", value: "5", unit: "u", reference: null, date: null,
+    confirmation: "confirmed", source: { page: 1, bbox: [0, 0, 1, 1] }, reported_page: null,
+  };
+  const local = {
+    provider: "pymupdf_tables", provider_version: "1.26.6", truncated: false, measurements: [row],
+  };
+  const external = {
+    provider: "gigachat_ultra", provider_version: "32.9.16.9", truncated: false,
+    measurements: [{ ...row, confirmation: "unverified", reported_page: 2, source: null }],
+  };
+  mocks.details.mockResolvedValue({
+    ...ready, text_version: { ...ready.text_version, structured_result: { local, external } },
+  });
+  mocks.refreshExtraction.mockResolvedValue({ status: "pending" });
+  render(<DocumentDetails id={item.id} />);
+  const user = userEvent.setup();
+  expect(await screen.findByText("Подтверждено")).toBeInTheDocument();
+  expect(screen.getByText("Не проверено")).toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "Стр. 2 (по модели)" })).toBeNull();
+  expect(screen.getByRole("link", { name: "Стр. 1" })).toHaveAttribute(
+    "href", "/api/documents/synthetic-id/download?inline=true#page=1",
+  );
+  expect(screen.getByRole("link", { name: "Просмотреть оригинал" })).toHaveAttribute(
+    "href", "/api/documents/synthetic-id/download?inline=true",
+  );
+  await user.click(screen.getByRole("button", { name: "Скачать оригинал" }));
+  expect(mocks.download).toHaveBeenCalledWith(item.id, item.original_filename);
+  await user.click(screen.getByRole("button", { name: "Скачать извлечённый текст" }));
+  expect(mocks.downloadExtractedText).toHaveBeenCalledWith("Synthetic PDF text", item.original_filename);
+  await user.click(screen.getByRole("button", { name: "Повторить локальное извлечение" }));
+  expect(mocks.refreshExtraction).toHaveBeenCalledWith(item.id);
+  expect(mocks.authorizeUltra).not.toHaveBeenCalled();
 });

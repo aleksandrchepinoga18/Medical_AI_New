@@ -8,11 +8,21 @@ from sqlalchemy.orm import Session
 
 from app.auth.models import User
 from app.core.config import Settings
+from app.documents.gigachat import UPLOAD_BYTES
 from app.documents.models import Document, DocumentIngestionJob
+from app.documents.schemas import (
+    EXTERNAL_UNRESOLVED,
+    ExternalAuthorization,
+    ExternalExtractionInput,
+    LocalRefreshRequest,
+    VersionRequest,
+)
 from app.documents.validation import inspect_upload
 from app.integrations.object_storage import ObjectStorage, StorageError, make_object_key
+from app.rag.service import latest_version
 
 ACTIVE = ("uploading", "queued", "processing")
+ACTIVE_JOBS = ("pending", "published", "processing")
 
 
 def owned_document(
@@ -152,3 +162,101 @@ def retry_document(db: Session, document_id: UUID, owner_id: UUID, settings: Set
     )
     db.commit()
     return document
+
+
+def authorize_external(
+    db: Session,
+    document_id: UUID,
+    owner_id: UUID,
+    data: ExternalExtractionInput,
+    settings: Settings,
+) -> DocumentIngestionJob:
+    db.scalar(select(User).where(User.id == owner_id).with_for_update())
+    document = owned_document(db, document_id, owner_id, lock=True)
+    if not data.consent:
+        raise HTTPException(403, "Explicit consent is required")
+    if settings.documents_extraction_provider != data.provider:
+        raise HTTPException(409, "External extraction is disabled")
+    if document.format != "pdf" or document.size_bytes > UPLOAD_BYTES:
+        raise HTTPException(415, "PDF is outside the supported external extraction scope")
+    version = latest_version(db, document.id)
+    if (
+        document.status not in {"ready", "needs_ocr"}
+        or document.sha256 != data.sha256
+        or version is None
+        or version.version != data.text_version
+    ):
+        raise HTTPException(409, "The requested original and text version are not current")
+    jobs = select(DocumentIngestionJob).where(DocumentIngestionJob.document_id == document.id)
+    if db.scalar(jobs.where(DocumentIngestionJob.error_code.in_(EXTERNAL_UNRESOLVED)).limit(1)):
+        raise HTTPException(409, "Previous external upload or cleanup is unconfirmed")
+    last = db.scalar(jobs.order_by(DocumentIngestionJob.version.desc()).limit(1))
+    if last is not None and last.external_request is not None:
+        if last.external_request.get("provider") == "pymupdf_tables":
+            if last.status in ACTIVE_JOBS:
+                raise HTTPException(409, "Local extraction is in progress")
+        else:
+            previous = ExternalAuthorization.model_validate(last.external_request)
+            if previous.text_version == data.text_version and (
+                last.status in ACTIVE_JOBS or last.status == "succeeded"
+            ):
+                db.commit()
+                return last
+    authorization = ExternalAuthorization(
+        **data.model_dump(), owner_id=owner_id, consented_at=datetime.now(UTC),
+    )
+    return queue_extraction(db, document, last, authorization, settings)
+
+
+def refresh_local(
+    db: Session, document_id: UUID, owner_id: UUID, settings: Settings,
+) -> DocumentIngestionJob:
+    db.scalar(select(User).where(User.id == owner_id).with_for_update())
+    document = owned_document(db, document_id, owner_id, lock=True)
+    version = latest_version(db, document.id)
+    if document.format != "pdf" or document.status not in {"ready", "needs_ocr"} or version is None:
+        raise HTTPException(409, "Local refresh requires a processed PDF")
+    last = db.scalar(
+        select(DocumentIngestionJob)
+        .where(DocumentIngestionJob.document_id == document.id)
+        .order_by(DocumentIngestionJob.version.desc()).limit(1)
+    )
+    if last is not None and last.status in ACTIVE_JOBS:
+        if last.external_request and last.external_request.get("provider") == "pymupdf_tables":
+            db.commit()
+            return last
+        raise HTTPException(409, "Extraction is in progress")
+    request = LocalRefreshRequest(
+        owner_id=owner_id, sha256=document.sha256, text_version=version.version,
+    )
+    return queue_extraction(db, document, last, request, settings)
+
+
+def queue_extraction(
+    db: Session, document: Document, last: DocumentIngestionJob | None,
+    request: VersionRequest, settings: Settings,
+) -> DocumentIngestionJob:
+    active = db.scalar(
+        select(func.count())
+        .select_from(DocumentIngestionJob)
+        .join(Document, Document.id == DocumentIngestionJob.document_id)
+        .where(
+            Document.owner_id == document.owner_id,
+            DocumentIngestionJob.external_request.is_not(None),
+            DocumentIngestionJob.status.in_(ACTIVE_JOBS),
+        )
+    )
+    if (active or 0) >= settings.documents_max_active:
+        raise HTTPException(429, "Document quota reached", headers={"Retry-After": "60"})
+    next_version = (last.version if last else 0) + 1
+    if next_version > settings.documents_max_versions:
+        raise HTTPException(429, "Document retry limit reached")
+    job = DocumentIngestionJob(
+        document_id=document.id,
+        version=next_version,
+        status="pending",
+        external_request=request.model_dump(mode="json"),
+    )
+    db.add(job)
+    db.commit()
+    return job

@@ -104,10 +104,13 @@ def search(
     require_hybrid: bool = False,
     include_evidence_metadata: bool = False,
     only_generation: UUID | None = None,
+    only_document_ids: set[UUID] | None = None,
 ) -> list[dict[str, Any]]:
     allowed_jobs = eligible(user_id, settings)
     if only_generation is not None:
         allowed_jobs = allowed_jobs.where(RagIndexJob.generation == only_generation)
+    if only_document_ids is not None:
+        allowed_jobs = allowed_jobs.where(RagIndexJob.document_id.in_(only_document_ids))
     jobs = list(db.scalars(allowed_jobs))
     if not jobs:
         return []

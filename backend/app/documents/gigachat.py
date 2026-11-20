@@ -1,18 +1,24 @@
-"""GigaChat file lifecycle for the isolated synthetic benchmark."""
+"""Shared GigaChat HTTP adapter for document extraction."""
 
 import asyncio
 import json
+import logging
 import re
+import ssl
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from time import perf_counter, time
+from time import monotonic, perf_counter, time
 from typing import Any, Literal
 from uuid import uuid4
 
 import httpx
 from pydantic import SecretStr, ValidationError
 
+from app.documents.extraction_data import Evidence, Measurement, Measurements
 from app.llm.gateway import GatewayError
-from evaluation.extraction_fixtures import Evidence, Measurement, Measurements
+
+logger = logging.getLogger(__name__)
 
 MODELS = {
     "lite": "GigaChat-2",
@@ -28,7 +34,7 @@ UPLOAD_BYTES = 5 * 1024 * 1024
 FILE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens", "precached_prompt_tokens")
 PROMPT = (
-    "Извлеки все лабораторные измерения из приложенного синтетического PDF. "
+    "Извлеки все лабораторные измерения из приложенного PDF. "
     "Одна запись на строку таблицы. Сохраняй исходные названия, знаки < и >, "
     "разделители, единицы, референсы и дату измерения. "
     "Не считай реквизиты, даты оформления и номера измерениями. "
@@ -37,6 +43,53 @@ PROMPT = (
     "заменить пробелами. Пропущенные или неподтверждённые поля запиши как null. "
     "Если измерений нет, верни пустой массив measurements. Верни только JSON."
 )
+
+
+def gigachat_tls_context(ca_bundle: str | None) -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    if ca_bundle:
+        context.load_verify_locations(cafile=ca_bundle)
+    return context
+
+
+def error_category(code: str) -> str:
+    suffix = code.partition("_")[2]
+    if suffix in {"tls", "timeout", "interrupted"}:
+        return suffix
+    if suffix == "transport":
+        return "network"
+    if suffix in {"http_401", "http_403", "expired_token"}:
+        return "authorization"
+    return "api_response"
+
+
+@contextmanager
+def log_stage(stage: str) -> Iterator[None]:
+    started = perf_counter()
+    code = None
+    try:
+        yield
+    except BaseException as error:
+        code = str(error) if isinstance(error, GatewayError) else f"{stage}_interrupted"
+        raise
+    finally:
+        elapsed_ms = round((perf_counter() - started) * 1000, 2)
+        # Log only adapter-generated codes. Never include a URL, exception or HTTP payload.
+        logger.log(logging.INFO if code is None else logging.WARNING, "%s", json.dumps({
+            "event": "gigachat_extraction", "stage": stage,
+            "status": "succeeded" if code is None else "failed",
+            "duration_ms": elapsed_ms,
+            "error_category": None if code is None else error_category(code),
+            "error_code": code,
+        }))
+
+
+def is_tls_error(error: BaseException | None) -> bool:
+    while error is not None:
+        if isinstance(error, ssl.SSLError):
+            return True
+        error = error.__cause__ or error.__context__
+    return False
 
 
 @dataclass
@@ -60,13 +113,17 @@ class GigaChatExtraction:
         model: str,
         mode: ResponseMode,
         *,
+        scope: str = "GIGACHAT_API_PERS",
+        prompt: str = PROMPT,
         request_seconds: float = 60,
         cleanup_seconds: float = 15,
     ) -> None:
         self.client = client
         self.credentials = credentials
-        self.model = MODELS[model]
+        self.model = MODELS.get(model, model)
         self.mode = mode
+        self.scope = scope
+        self.prompt = prompt
         self.request_seconds = request_seconds
         self.cleanup_seconds = cleanup_seconds
         self.access_token = ""
@@ -75,13 +132,16 @@ class GigaChatExtraction:
     async def request(
         self, phase: str, url: str, *, timeout: float, **kwargs: Any
     ) -> httpx.Response:
+        if timeout <= 0:
+            raise GatewayError(f"{phase}_timeout")
         try:
             async with asyncio.timeout(timeout):
                 response = await self.client.post(url, **kwargs)
         except (TimeoutError, httpx.TimeoutException):
             raise GatewayError(f"{phase}_timeout") from None
-        except httpx.HTTPError:
-            raise GatewayError(f"{phase}_transport") from None
+        except httpx.HTTPError as error:
+            failure = "tls" if is_tls_error(error) else "transport"
+            raise GatewayError(f"{phase}_{failure}") from None
         if not response.is_success:
             raise GatewayError(f"{phase}_http_{response.status_code}")
         return response
@@ -98,23 +158,24 @@ class GigaChatExtraction:
 
     async def headers(self, *, timeout: float) -> dict[str, str]:
         if time() + 30 >= self.expires_at:
-            response = await self.request(
-                "oauth", OAUTH_URL, timeout=timeout,
-                headers={
-                    "Accept": "application/json",
-                    "Authorization": f"Basic {self.credentials.get_secret_value()}",
-                    "RqUID": str(uuid4()),
-                },
-                data={"scope": "GIGACHAT_API_PERS"},
-            )
-            body = self.object(response, "oauth")
-            token, expires = body.get("access_token"), body.get("expires_at")
-            if not isinstance(token, str) or not token or type(expires) is not int:
-                raise GatewayError("oauth_invalid_response")
-            expires_at = expires / 1000 if expires >= 10**12 else float(expires)
-            if expires_at <= time():
-                raise GatewayError("oauth_expired_token")
-            self.access_token, self.expires_at = token, expires_at
+            with log_stage("oauth"):
+                response = await self.request(
+                    "oauth", OAUTH_URL, timeout=timeout,
+                    headers={
+                        "Accept": "application/json",
+                        "Authorization": f"Basic {self.credentials.get_secret_value()}",
+                        "RqUID": str(uuid4()),
+                    },
+                    data={"scope": self.scope},
+                )
+                body = self.object(response, "oauth")
+                token, expires = body.get("access_token"), body.get("expires_at")
+                if not isinstance(token, str) or not token or type(expires) is not int:
+                    raise GatewayError("oauth_invalid_response")
+                expires_at = expires / 1000 if expires >= 10**12 else float(expires)
+                if expires_at <= time():
+                    raise GatewayError("oauth_expired_token")
+                self.access_token, self.expires_at = token, expires_at
         return {"Authorization": f"Bearer {self.access_token}", "Accept": "application/json"}
 
     def payload(self, file_id: str) -> dict[str, Any]:
@@ -122,7 +183,7 @@ class GigaChatExtraction:
         # Send a self-contained schema with no local references.
         del schema["$defs"]
         schema["properties"]["measurements"]["items"] = Measurement.model_json_schema()
-        content = PROMPT
+        content = self.prompt
         if self.mode == "prompt-json":
             content += "\nСхема JSON:\n" + json.dumps(schema, ensure_ascii=False)
         payload: dict[str, Any] = {
@@ -170,31 +231,44 @@ class GigaChatExtraction:
             Evidence.model_validate(row.model_dump()) for row in parsed.measurements
         ]
 
-    async def extract(self, pdf: bytes) -> GigaChatResult:
+    async def extract(
+        self, pdf: bytes, *, deadline: float | None = None, upload_name: str | None = None,
+    ) -> GigaChatResult:
         result = GigaChatResult()
         if not pdf.startswith(b"%PDF-") or len(pdf) > UPLOAD_BYTES:
             result.error = "invalid_fixture"
             return result
         start = perf_counter()
         file_id = None
+
+        def available(limit: float, cutoff: float | None) -> float:
+            return limit if cutoff is None else min(limit, cutoff - monotonic())
+
+        request_deadline = None if deadline is None else deadline - self.cleanup_seconds
         try:
-            headers = await self.headers(timeout=self.request_seconds)
-            result.upload_name = f"synthetic-benchmark-{uuid4().hex}.pdf"
-            result.deletion = "unknown"
-            upload = await self.request(
-                "upload", f"{API}/files", timeout=self.request_seconds, headers=headers,
-                data={"purpose": "general"},
-                files={"file": (result.upload_name, pdf, "application/pdf")},
-            )
-            candidate = self.object(upload, "upload").get("id")
-            if not isinstance(candidate, str) or not FILE_ID.fullmatch(candidate):
-                raise GatewayError("upload_invalid_response")
+            headers = await self.headers(timeout=available(self.request_seconds, request_deadline))
+            with log_stage("upload"):
+                upload_timeout = available(self.request_seconds, request_deadline)
+                if upload_timeout <= 0:
+                    raise GatewayError("upload_timeout")
+                result.upload_name = upload_name or f"synthetic-benchmark-{uuid4().hex}.pdf"
+                result.deletion = "unknown"
+                upload = await self.request(
+                    "upload", f"{API}/files", timeout=upload_timeout, headers=headers,
+                    data={"purpose": "general"},
+                    files={"file": (result.upload_name, pdf, "application/pdf")},
+                )
+                candidate = self.object(upload, "upload").get("id")
+                if not isinstance(candidate, str) or not FILE_ID.fullmatch(candidate):
+                    raise GatewayError("upload_invalid_response")
             file_id = candidate
-            completion = await self.request(
-                "completion", f"{API}/chat/completions",
-                timeout=self.request_seconds, headers=headers, json=self.payload(file_id),
-            )
-            self.read_completion(completion, result)
+            with log_stage("completion"):
+                completion = await self.request(
+                    "completion", f"{API}/chat/completions",
+                    timeout=available(self.request_seconds, request_deadline),
+                    headers=headers, json=self.payload(file_id),
+                )
+                self.read_completion(completion, result)
         except GatewayError as error:
             result.error = str(error)
             if result.error in {
@@ -204,13 +278,18 @@ class GigaChatExtraction:
         finally:
             if file_id is not None:
                 try:
-                    headers = await self.headers(timeout=self.cleanup_seconds)
-                    deleted = await self.request(
-                        "delete", f"{API}/files/{file_id}/delete",
-                        timeout=self.cleanup_seconds, headers=headers,
-                    )
-                    if deleted.status_code != 200:
-                        raise GatewayError("delete_unconfirmed")
+                    cleanup_deadline = monotonic() + available(self.cleanup_seconds, deadline)
+                    with log_stage("delete"):
+                        headers = await self.headers(
+                            timeout=available(self.cleanup_seconds, cleanup_deadline),
+                        )
+                        deleted = await self.request(
+                            "delete", f"{API}/files/{file_id}/delete",
+                            timeout=available(self.cleanup_seconds, cleanup_deadline),
+                            headers=headers,
+                        )
+                        if deleted.status_code != 200:
+                            raise GatewayError("delete_unconfirmed")
                 except GatewayError as error:
                     result.deletion = "failed"
                     result.cleanup_error = str(error)

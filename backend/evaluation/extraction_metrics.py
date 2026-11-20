@@ -1,67 +1,19 @@
 """Measure fidelity of extracted records independently of source accuracy."""
 
-import re
-import unicodedata
 from collections import Counter
 from collections.abc import Mapping
 from itertools import product
 
 import pymupdf
 
-from evaluation.extraction_fixtures import FIELDS, Evidence
-
-SIGNED_DECIMAL = r"[+\-−]?[0-9]+(?:[.,][0-9]+)?"
-SCALAR = re.compile(rf"([<>≤≥]?)\s*({SIGNED_DECIMAL})")
-RANGE = re.compile(rf"({SIGNED_DECIMAL})\s*[-–—‐‑‒−]\s*({SIGNED_DECIMAL})")
-SUPERSCRIPT = re.compile(r"(?<=[0-9a-zA-Zа-яА-Я)])[⁺⁻]?[⁰¹²³⁴⁵⁶⁷⁸⁹]+")
-EXPONENT_CHARS = str.maketrans("⁺⁻⁰¹²³⁴⁵⁶⁷⁸⁹", "+-0123456789")
-
-
-def strict_text(value: str | None) -> str | None:
-    if value is None:
-        return None
-    return " ".join(unicodedata.normalize("NFC", value).split()) or None
-
-
-def decimal_text(value: str) -> str:
-    value = value.replace("−", "-")
-    whole, comma, fraction = value.partition(",")
-    digits = whole.lstrip("+-")
-    # A single separator can also mean digit grouping in e.g. 1,234 / 1.234.
-    if comma and not (len(fraction) == 3 and 1 <= len(digits) <= 3 and digits[0] != "0"):
-        return f"{whole}.{fraction}"
-    return value
-
-
-def numeric(value: str) -> str | None:
-    match = SCALAR.fullmatch(value)
-    if match is None:
-        return None
-    operator, number = match.groups()
-    return operator + decimal_text(number)
-
-
-def normalize_field(field: str, value: str | None) -> str | None:
-    if value is None:
-        return None
-    if field == "unit":
-        value = value.replace("µ", "μ")
-        value = SUPERSCRIPT.sub(lambda match: "^" + match[0].translate(EXPONENT_CHARS), value)
-        return re.sub(r"\s*([/^·])\s*", r"\1", value)
-    if field == "reference" and (interval := RANGE.fullmatch(value)):
-        low, high = interval.groups()
-        return f"{decimal_text(low)}-{decimal_text(high)}"
-    if field in {"value", "reference"}:
-        return numeric(value) or value
-    return value
-
-
-def record_key(record: Evidence) -> tuple[str | None, ...]:
-    return tuple(strict_text(getattr(record, field)) for field in FIELDS)
-
-
-def normalized_key(key: tuple[str | None, ...]) -> tuple[str | None, ...]:
-    return tuple(normalize_field(field, value) for field, value in zip(FIELDS, key, strict=True))
+from app.documents.extraction_data import (
+    FIELDS,
+    Evidence,
+    normalized_key,
+    numeric,
+    record_key,
+    strict_text,
+)
 
 
 def verbatim_matches(actual: Evidence, expected: Evidence, page_text: str) -> bool:

@@ -4,9 +4,24 @@ export type DocumentItem = {
   status: string; error_code: string | null; created_at: string; updated_at: string;
 };
 export type DocumentPage = { items: DocumentItem[]; total: number; offset: number; limit: number };
+export type ExtractionJob = { job_id: string; status: string; error_code: string | null; text_version: number };
+export type Measurement = {
+  name: string; value: string; unit: string | null; reference: string | null; date: string | null;
+  reported_page: number | null; source: { page: number; bbox: number[] } | null;
+  confirmation: "confirmed" | "unverified" | "ambiguous";
+};
+export type ExtractionReport = {
+  provider: "pymupdf_tables" | "gigachat_ultra"; provider_version: string; model: string | null;
+  measurements: Measurement[]; truncated: boolean;
+};
 export type DocumentDetails = DocumentItem & {
   text_version: { version: number; normalized_text: string; extractor_version: string;
-    locators: Array<Record<string, string | number>> } | null;
+    locators: Array<Record<string, string | number>>;
+    structured_result?: { local: ExtractionReport | null; external: ExtractionReport | null } | null;
+  } | null;
+  local_refresh?: ExtractionJob | null;
+  external_extraction?: ExtractionJob | null;
+  external_extraction_enabled?: boolean;
 };
 
 export class DocumentApiError extends Error {
@@ -66,11 +81,42 @@ export async function retryDocument(id: string): Promise<DocumentItem> {
   }))).json();
 }
 
+export async function refreshExtraction(id: string): Promise<ExtractionJob> {
+  const token = await csrf();
+  return (await checked(await fetch(`/api/documents/${encodeURIComponent(id)}/refresh-extraction`, {
+    method: "POST", cache: "no-store", headers: { "X-CSRF-Token": token },
+  }))).json();
+}
+
+export async function authorizeUltra(
+  id: string, sha256: string, textVersion: number,
+): Promise<ExtractionJob> {
+  const token = await csrf();
+  return (await checked(await fetch(`/api/documents/${encodeURIComponent(id)}/external-extraction`, {
+    method: "POST", cache: "no-store",
+    headers: { "X-CSRF-Token": token, "Content-Type": "application/json" },
+    body: JSON.stringify({ provider: "gigachat_ultra", consent: true, sha256, text_version: textVersion }),
+  }))).json();
+}
+
+export function previewOriginal(id: string, page?: number): string {
+  return `/api/documents/${encodeURIComponent(id)}/download?inline=true${page ? `#page=${page}` : ""}`;
+}
+
 export async function downloadDocument(id: string, filename: string): Promise<void> {
   const response = await checked(await fetch(`/api/documents/${encodeURIComponent(id)}/download`, {
     cache: "no-store",
   }));
-  const url = URL.createObjectURL(await response.blob());
+  saveDownload(await response.blob(), filename);
+}
+
+export function downloadExtractedText(text: string, filename: string): void {
+  saveDownload(new Blob([text], { type: "text/plain;charset=utf-8" }),
+    `${filename.replace(/\.[^.]+$/, "")}-извлечённый.txt`);
+}
+
+function saveDownload(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
   anchor.download = filename;
@@ -86,6 +132,10 @@ export const statusNames: Record<string, string> = {
 };
 export const activeStatuses = new Set(["uploading", "queued", "processing"]);
 export const activeIndexStatuses = new Set(["pending", "published", "processing"]);
+export const extractionJobStatuses: Record<string, string> = {
+  pending: "В очереди", published: "В очереди", processing: "Обрабатывается",
+  succeeded: "Завершено", failed: "Ошибка",
+};
 export const indexStatusNames: Record<string, string> = {
   disabled: "Поиск выключен", not_indexed: "Индекс отсутствует", pending: "Индекс в очереди",
   published: "Индекс в очереди", processing: "Индексация", ready: "Индекс готов",
@@ -103,6 +153,18 @@ export function processingMessage(code: string | null): string {
     UPLOAD_INCOMPLETE: "Оригинал не получен полностью. Загрузите документ заново.",
     CHECKSUM_MISMATCH: "Контрольная сумма оригинала не совпала. Нужна новая загрузка.",
     ORIGINAL_MISSING: "Оригинал недоступен. Нужна новая загрузка.",
+    EXTERNAL_TIMEOUT: "GigaChat не ответил за отведённое время.",
+    EXTERNAL_API_ERROR: "GigaChat не вернул пригодный результат извлечения.",
+    EXTERNAL_MODEL_MISMATCH: "Ответ получен от другой модели.",
+    EXTERNAL_DISABLED: "Внешнее извлечение отключено.",
+    EXTERNAL_NOT_CONFIGURED: "Подключение GigaChat не настроено.",
+    EXTERNAL_TLS_CONFIG: "Не удалось проверить настройки сертификатов GigaChat.",
+    EXTERNAL_TLS_ERROR: "Не удалось проверить сертификат GigaChat. Проверьте доверенные CA в worker.",
+    EXTERNAL_NETWORK_ERROR: "Не удалось установить соединение с GigaChat.",
+    EXTERNAL_AUTH_ERROR: "GigaChat отклонил авторизацию. Проверьте ключ и область доступа.",
+    EXTERNAL_UPLOAD_UNCONFIRMED: "Статус загрузки в GigaChat неизвестен. Повторная отправка заблокирована.",
+    EXTERNAL_CLEANUP_UNCONFIRMED: "Удаление файла в GigaChat не подтверждено. Повторная отправка заблокирована.",
+    EXTERNAL_INTERRUPTED: "Внешнее извлечение прервано. Повторная отправка заблокирована.",
   };
   return messages[code] ?? "Обработка не удалась. Можно повторить попытку или загрузить другой файл.";
 }

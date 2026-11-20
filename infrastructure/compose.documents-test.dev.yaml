@@ -1,0 +1,18 @@
+# Use with compose.documents-test.yaml and locally built test images.
+services:
+  worker:
+    environment:
+      PYTHONPATH: /app
+    volumes:
+      - ../backend/app:/app/app:ro
+  tests:
+    environment:
+      PYTHONPATH: /app
+    volumes:
+      - ../backend/app:/app/app:ro
+      - ../backend/tests:/app/tests:ro
+      - ../backend/alembic:/app/alembic:ro
+      - ../backend/alembic.ini:/app/alembic.ini:ro
+      - ../backend/pyproject.toml:/app/pyproject.toml:ro
+      - ../backend/evaluation:/app/evaluation:ro
+      - ../backend/scripts:/app/scripts:ro

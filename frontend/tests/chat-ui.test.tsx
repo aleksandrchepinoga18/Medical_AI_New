@@ -16,21 +16,22 @@ it("opens saved history and keeps a failed message for retry", async () => {
     if (!path) return Response.json([{ id: "one", title: "Saved" }]);
     return Response.json({ messages: [{ id: "m", role: "assistant", content: "<script>text</script>",
       status: "complete", sources: [{ document_id: "doc", filename: "synthetic.pdf",
-        source_url: "/documents/doc#source-page-2", sources: [{ kind: "page", index: 2 }] }] }] });
+        source_id: "S1", source_url: "/documents/doc#source-page-2",
+        sources: [{ kind: "page", index: 2 }] }] }] });
   });
   render(<PersonalChat />);
   const user = userEvent.setup();
   await user.click(await screen.findByRole("button", { name: "Saved" }));
   expect(await screen.findByText("<script>text</script>")).toBeInTheDocument();
   expect(document.querySelector("script")).toBeNull();
-  expect(screen.getByRole("link", { name: "synthetic.pdf" })).toHaveAttribute("href", "/documents/doc#source-page-2");
+  expect(screen.getByRole("link", { name: "[S1] synthetic.pdf" })).toHaveAttribute("href", "/documents/doc#source-page-2");
   await user.type(screen.getByLabelText("Сообщение"), "synthetic question");
   await user.click(screen.getByRole("button", { name: "Отправить" }));
   expect(await screen.findByRole("alert")).toHaveTextContent("недоступен");
   expect(screen.getByLabelText("Сообщение")).toHaveValue("synthetic question");
 });
 
-it("keeps streaming through state updates and aborts only when Stop is clicked", async () => {
+it("keeps streaming through state and router updates until Stop is clicked", async () => {
   let signal: AbortSignal | undefined;
   let emit: ((event: ChatEvent) => void) | undefined;
   mocks.request.mockImplementation(async (path: string, method = "GET", _body?: unknown,
@@ -47,7 +48,7 @@ it("keeps streaming through state updates and aborts only when Stop is clicked",
       signal?.addEventListener("abort", () => reject(new DOMException("Stopped", "AbortError")));
     });
   });
-  render(<PersonalChat />);
+  const view = render(<PersonalChat />);
   const user = userEvent.setup();
   await user.click(await screen.findByRole("button", { name: "Saved" }));
   await user.type(await screen.findByLabelText("Сообщение"), "Synthetic");
@@ -55,6 +56,9 @@ it("keeps streaming through state updates and aborts only when Stop is clicked",
   await waitFor(() => expect(emit).toBeDefined());
   act(() => emit?.({ type: "delta", text: "Synthetic streamed text" }));
   expect(await screen.findByText("Synthetic streamed text")).toBeInTheDocument();
+  expect(signal?.aborted).toBe(false);
+  mocks.router = { replace: vi.fn() };
+  view.rerender(<PersonalChat />);
   expect(signal?.aborted).toBe(false);
   await user.click(screen.getByRole("button", { name: "Остановить" }));
   expect(signal?.aborted).toBe(true);

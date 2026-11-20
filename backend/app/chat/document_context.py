@@ -16,6 +16,7 @@ from app.chat.evidence import (
     EvidenceHit,
     Measurement,
     Overview,
+    document_section,
     evidence_statements,
     indicator_names,
     measurement,
@@ -67,18 +68,32 @@ def current_extractions(
             Document.owner_id == user_id,
             or_(
                 Document.status == "ready",
+                (Document.status == "needs_ocr")
+                & DocumentTextVersion.structured_result.is_not(None),
                 (Document.status == "failed") & (Document.error_code == "ORIGINAL_MISSING"),
             ),
             DocumentTextVersion.version == latest,
-            DocumentTextVersion.normalized_text != "",
+            or_(
+                DocumentTextVersion.normalized_text != "",
+                DocumentTextVersion.structured_result.is_not(None),
+            ),
         )
     )
 
 
 def resolve_documents(
-    db: Session, user_id: UUID, reference: DocumentReference
+    db: Session, user_id: UUID, reference: DocumentReference, *, all_structured: bool = False,
+    allow_multiple: bool = False,
 ) -> tuple[list[Extraction], str | None]:
     query = current_extractions(user_id)
+    if all_structured and reference is None:
+        structured_result = db.execute(
+            query.where(DocumentTextVersion.structured_result.is_not(None))
+            .order_by(Document.document_number)
+        )
+        structured_rows = structured_result.all()
+        extractions = [Extraction(doc, version) for doc, version in structured_rows]
+        return extractions, None if extractions else "Нет документов с сохранёнными измерениями."
     if reference == "":
         return [], "Вставьте одну ссылку на карточку или укажите номера документов."
     if isinstance(reference, UUID):
@@ -115,7 +130,7 @@ def resolve_documents(
                 if number in registered else f"Документ № {number} не найден."
                 for number in missing
             )
-    elif len(choices) != 1:
+    elif len(choices) != 1 and not (choices and reference is None and allow_multiple):
         if not choices:
             return [], MISSING
         labels = [f"№ {number} — {name}" for _, number, name in choices[:10]]
@@ -129,15 +144,15 @@ def resolve_documents(
         .order_by(Document.id)
         .with_for_update(read=True)
     )
-    rows = [Extraction(doc, version) for doc, version in db.execute(
-        query.where(Document.id.in_(ids))
-    )]
-    if len(rows) != len(ids):
+    matching_result = db.execute(query.where(Document.id.in_(ids)))
+    matching_rows = matching_result.all()
+    extractions = [Extraction(doc, version) for doc, version in matching_rows]
+    if len(extractions) != len(ids):
         return [], MISSING
     if isinstance(reference, tuple):
-        by_number = {row.document.document_number: row for row in rows}
-        rows = [by_number[number] for number in reference]
-    return rows, None
+        by_number = {item.document.document_number: item for item in extractions}
+        return [by_number[number] for number in reference], None
+    return extractions, None
 
 
 def extracted_pages(extraction: Extraction) -> Iterator[EvidenceHit]:
@@ -154,6 +169,31 @@ def extracted_pages(extraction: Extraction) -> Iterator[EvidenceHit]:
         }
 
 
+def section_excerpt(extraction: Extraction, section: str) -> EvidenceHit | None:
+    for page in extracted_pages(extraction):
+        lines = page["text"].splitlines()
+        for index, line in enumerate(lines):
+            heading, _, inline = line.partition(":")
+            if document_section(heading, heading=True) != section:
+                continue
+            body = inline.strip()
+            if not body:
+                following: list[str] = []
+                for item in lines[index + 1:]:
+                    if document_section(item.partition(":")[0], heading=True):
+                        break
+                    if item.strip():
+                        following.append(item.strip())
+                    elif following:
+                        break
+                body = " ".join(following)
+            if normalized(body).rstrip(".") in {"", "нет", "отсутствует", "не указано", "-", "—"}:
+                continue
+            excerpt = body if len(body) <= 600 else body[:599].rstrip() + "…"
+            return {**page, "text": excerpt}
+    return None
+
+
 def extraction_hit(extraction: Extraction, url: str, text: str) -> EvidenceHit:
     document = extraction.document
     return {
@@ -165,6 +205,7 @@ def extraction_hit(extraction: Extraction, url: str, text: str) -> EvidenceHit:
         "sources": [],
         "text_version_id": str(extraction.version.id),
         "extraction_only": True,
+        "has_structured": extraction.version.structured_result is not None,
     }
 
 
@@ -206,7 +247,10 @@ def ranked_fragments(
 ) -> list[tuple[int, EvidenceHit]]:
     candidates: list[tuple[int, int, EvidenceHit]] = []
     for page in pages:
-        structured = {row["text"] for row, _ in page_measurements(page)}
+        structured = (
+            set() if page.get("has_structured")
+            else {row["text"] for row, _ in page_measurements(page)}
+        )
         per_priority: Counter[int] = Counter()
         for raw in page["text"].splitlines():
             line = raw.strip()
@@ -313,6 +357,34 @@ def indicator_context(extraction: Extraction) -> OverviewContext:
         unconfirmed_labels = ", ".join(hit["text"] for hit in unconfirmed)
         groups.append(f"Упоминания без подтверждённого измерения: {unconfirmed_labels}")
     return OverviewContext("\n".join(groups), [*confirmed.values(), *unconfirmed])
+
+
+def legacy_deviations(extraction: Extraction, question: str, budget: int) -> OverviewContext:
+    targets = {key for key, _ in indicator_names(question)}
+    outside: dict[str, EvidenceHit] = {}
+    inside: list[EvidenceHit] = []
+    for page in extracted_pages(extraction):
+        for hit, result in page_measurements(page):
+            if targets and result.indicator not in targets:
+                continue
+            if result.status == "в пределах указанного интервала":
+                inside.append(hit)
+            elif result.status in ("ниже указанного интервала", "выше указанного интервала"):
+                text = f"{hit['text']} — {result.status}"
+                outside.setdefault(text, {**hit, "text": text})
+    if not outside:
+        if inside:
+            return OverviewContext(
+                "В сопоставимых записях отклонений не найдено.", [], supporting_hits=inside,
+            )
+        return OverviewContext("Нет подтверждённых значений с сопоставимым референсом.", [])
+    hits: list[EvidenceHit] = []
+    for text, hit in outside.items():
+        if len(text) <= budget:
+            hits.append(hit)
+            budget -= len(text)
+    answer = "\n".join(f"• {hit['text']}" for hit in hits)
+    return OverviewContext(answer or "Подтверждённые отклонения не поместились в ответ.", hits)
 
 
 def overview_context(

@@ -11,6 +11,7 @@ from pathlib import Path
 from threading import Barrier
 from uuid import UUID, uuid4
 
+import httpx
 import pymupdf
 import pytest
 from alembic.config import Config
@@ -26,12 +27,15 @@ from alembic import command
 from app.core.config import Settings
 from app.db import database_url, get_db, get_settings
 from app.documents import processing
+from app.documents.gigachat import API, OAUTH_URL
 from app.documents.models import Document, DocumentIngestionJob, DocumentTextVersion
 from app.documents.processing import ExtractionResult, process_job
+from app.documents.providers import UltraExtraction
 from app.documents.routes import get_storage
 from app.documents.service import create_upload
 from app.integrations.object_storage import ObjectStorage, StorageError
 from app.main import app
+from app.rag.models import RagIndexJob
 from app.workers.ingestion_dispatcher import dispatch_once
 
 pytestmark = pytest.mark.integration
@@ -345,6 +349,169 @@ def test_lost_upload_response_recovers_reserved_object(
     job_id = due_job(engine, item["id"])
     process_job(job_id, engine, storage, settings)
     assert client.get(f"/documents/{item['id']}").json()["status"] == "ready"
+
+
+def test_external_requires_owner_consent_and_enriches_legacy_version(
+    client: TestClient, environment, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, storage, _ = environment
+    monkeypatch.setenv("DOCUMENTS_EXTRACTION_PROVIDER", "gigachat_ultra")
+    monkeypatch.setenv("GIGACHAT_CREDENTIALS", "synthetic-key")
+    get_settings.cache_clear()
+    try:
+        settings = get_settings()
+        calls: list[str] = []
+        providers: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            calls.append(url)
+            if url == OAUTH_URL:
+                return httpx.Response(200, json={
+                    "access_token": "mock-access", "expires_at": int(time.time()) + 600,
+                })
+            if url == f"{API}/files":
+                assert b"document-extraction-" in request.content
+                return httpx.Response(200, json={"id": "synthetic-file"})
+            if url == f"{API}/chat/completions":
+                return httpx.Response(200, json={
+                    "model": "GigaChat-3-Ultra:32.9.16.9",
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {"content": '{"measurements":[]}'},
+                    }],
+                })
+            assert url == f"{API}/files/synthetic-file/delete"
+            return httpx.Response(200)
+
+        actual_provider = processing.extraction_provider
+
+        def mocked_provider(name, current_settings, **kwargs):
+            providers.append(name)
+            provider = actual_provider(name, current_settings, **kwargs)
+            if isinstance(provider, UltraExtraction):
+                provider.transport = httpx.MockTransport(handler)
+            return provider
+
+        monkeypatch.setattr(processing, "extraction_provider", mocked_provider)
+        item = upload(client).json()
+        document_id = item["id"]
+        job_id = due_job(engine, document_id)
+        process_job(job_id, engine, storage, settings)
+        assert calls == []
+        assert providers == ["pymupdf_tables"]
+        with Session(engine) as db:
+            text_version = db.scalar(
+                select(DocumentTextVersion).where(
+                    DocumentTextVersion.document_id == UUID(document_id)
+                )
+            )
+            assert text_version is not None and text_version.structured_result is not None
+            assert text_version.structured_result["local"]
+            text_version.structured_result = None  # Legacy row after the additive migration.
+            db.commit()
+
+        path = f"/documents/{document_id}/external-extraction"
+        before = client.get(f"/documents/{document_id}").json()["text_version"]
+        assert before["structured_result"] is None
+        body = {
+            "provider": "gigachat_ultra", "sha256": item["sha256"],
+            "text_version": before["version"], "consent": True,
+        }
+        assert client.post(path, headers=headers(client), json={
+            **body, "consent": False,
+        }).status_code == 403
+        assert client.post(path, headers=headers(client), json={
+            **body, "sha256": "0" * 64,
+        }).status_code == 409
+        rejected = client.post(path, headers=headers(client), json=body)
+        assert rejected.status_code == 202
+        rejected_id = UUID(rejected.json()["job_id"])
+        with Session(engine) as db:
+            job = db.get(DocumentIngestionJob, rejected_id)
+            assert job is not None and job.external_request is not None
+            job.external_request = {**job.external_request, "consent": False}
+            db.commit()
+        process_job(rejected_id, engine, storage, settings)
+        assert client.get(f"{path}/{rejected_id}").json()["error_code"] == "EXTERNAL_NOT_AUTHORIZED"
+        assert calls == []
+        assert providers == ["pymupdf_tables"]
+        with TestClient(app, client=(uuid4().hex, 50000)) as other:
+            assert other.post("/auth/register", headers=headers(other), json={
+                "email": f"{uuid4()}@example.org", "password": "synthetic-password-123",
+            }).status_code == 201
+            assert other.post(path, headers=headers(other), json=body).status_code == 404
+            refresh = f"/documents/{document_id}/refresh-extraction"
+            assert other.post(refresh, headers=headers(other)).status_code == 404
+            requested = client.post(path, headers=headers(client), json=body)
+            assert requested.status_code == 202
+            external_id = requested.json()["job_id"]
+            assert other.get(f"{path}/{external_id}").status_code == 404
+        assert calls == []
+        assert client.post(path, headers=headers(client), json=body).json()["job_id"] == external_id
+
+        process_job(UUID(external_id), engine, storage, settings)
+        process_job(UUID(external_id), engine, storage, settings)
+        assert providers == ["pymupdf_tables", "gigachat_ultra"]
+        assert calls == [
+            OAUTH_URL,
+            f"{API}/files",
+            f"{API}/chat/completions",
+            f"{API}/files/synthetic-file/delete",
+        ]
+        assert client.get(f"{path}/{external_id}").json()["status"] == "succeeded"
+        details = client.get(f"/documents/{document_id}").json()
+        assert details["status"] == "ready"
+        after = details["text_version"]
+        for key in ("version", "normalized_text", "locators"):
+            assert after[key] == before[key]
+        assert after["structured_result"]["external"]["provider_version"] == "32.9.16.9"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_refresh_legacy_pdf_preserves_version_and_index(client: TestClient, environment) -> None:
+    engine, storage, base = environment
+    settings = base.model_copy(update={"rag_enabled": True})
+    payload = pdf_bytes("Synthetic original for refresh")
+    item = upload(client, payload=payload).json()
+    document_id = item["id"]
+    path = f"/documents/{document_id}"
+    process_job(due_job(engine, document_id), engine, storage, settings)
+    with Session(engine) as db:
+        version = db.scalar(
+            select(DocumentTextVersion).where(DocumentTextVersion.document_id == UUID(document_id))
+        )
+        assert version is not None
+        index = db.scalar(select(RagIndexJob).where(RagIndexJob.text_version_id == version.id))
+        assert index is not None
+        version_id, index_id = version.id, index.id
+        version.structured_result = None
+        db.commit()
+    before = client.get(path).json()["text_version"]
+    original = client.get(f"{path}/download")
+    preview = client.get(f"{path}/download?inline=true")
+    assert original.content == preview.content == payload
+    assert original.headers["content-disposition"].startswith("attachment")
+    assert preview.headers["content-disposition"].startswith("inline")
+    assert preview.headers["content-type"] == "application/pdf"
+    response = client.post(f"{path}/refresh-extraction", headers=headers(client))
+    assert response.status_code == 202
+    job = response.json()
+    assert client.post(f"{path}/refresh-extraction", headers=headers(client)).json() == job
+    process_job(UUID(job["job_id"]), engine, storage, settings)
+    details = client.get(path).json()
+    assert details["local_refresh"]["status"] == "succeeded"
+    assert details["text_version"]["structured_result"]["local"]["provider"] == "pymupdf_tables"
+    for field in ("version", "normalized_text", "locators"):
+        assert details["text_version"][field] == before[field]
+    with Session(engine) as db:
+        assert list(db.scalars(select(DocumentTextVersion.id).where(
+            DocumentTextVersion.document_id == UUID(document_id)
+        ))) == [version_id]
+        assert list(db.scalars(select(RagIndexJob.id).where(
+            RagIndexJob.document_id == UUID(document_id)
+        ))) == [index_id]
 
 
 def test_backoff_retry_and_single_result(client: TestClient, environment, monkeypatch) -> None:

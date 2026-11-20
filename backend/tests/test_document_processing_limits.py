@@ -38,7 +38,7 @@ def test_parser_timeout_is_bounded_and_has_no_captured_document_output(monkeypat
         calls.append(kwargs)
         raise subprocess.TimeoutExpired("synthetic parser", 1)
 
-    monkeypatch.setattr("app.documents.processing.subprocess.run", timeout)
+    monkeypatch.setattr("app.documents.providers.subprocess.run", timeout)
     with pytest.raises(ProcessingError, match="PROCESSING_TIMEOUT"):
         extract_original(document(), SyntheticStorage(), settings)
     assert 0 < calls[0]["timeout"] <= settings.documents_processing_seconds
@@ -53,7 +53,7 @@ def test_checksum_mismatch_never_reaches_parser(monkeypatch) -> None:
     original.sha256 = "0" * 64
     calls = []
     monkeypatch.setattr(
-        "app.documents.processing.subprocess.run", lambda *args, **kwargs: calls.append(True)
+        "app.documents.providers.subprocess.run", lambda *args, **kwargs: calls.append(True)
     )
     with pytest.raises(ProcessingError, match="CHECKSUM_MISMATCH"):
         extract_original(original, SyntheticStorage(), Settings(redis_password="synthetic-unused"))

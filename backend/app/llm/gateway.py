@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
+from time import perf_counter
 from typing import Any, Protocol, TypeVar
 
 import httpx
@@ -12,7 +13,7 @@ from pydantic import BaseModel, ValidationError
 from app.core.config import Settings
 
 T = TypeVar("T", bound=BaseModel)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error").getChild("ollama")
 
 
 async def response_lines(response: httpx.Response) -> AsyncIterator[bytes]:
@@ -34,6 +35,10 @@ async def response_lines(response: httpx.Response) -> AsyncIterator[bytes]:
 
 class GatewayError(Exception):
     """Safe machine-readable error; no upstream payload."""
+
+
+class _StructuredOutputLimit(Exception):
+    """The provider reached num_predict after yielding its last structured chunk."""
 
 
 class Provider(Protocol):
@@ -65,6 +70,12 @@ class Ollama:
         if schema is not None:
             payload["format"] = schema
         size = 0
+        started = perf_counter()
+        logger.info(
+            "ollama_request num_ctx=%d num_predict=%d messages=%d input_bytes=%d",
+            self.settings.llm_context_tokens, self.settings.llm_max_tokens, len(messages),
+            sum(len(message["content"].encode()) for message in messages),
+        )
         try:
             async with asyncio.timeout(self.settings.llm_timeout_seconds):
                 async with httpx.AsyncClient(
@@ -78,6 +89,10 @@ class Ollama:
                         self.settings.llm_ollama_url + "/api/chat",
                         json=payload,
                     ) as response:
+                        logger.info(
+                            "ollama_headers status=%d duration_ms=%.0f",
+                            response.status_code, (perf_counter() - started) * 1000,
+                        )
                         if response.status_code != 200:
                             raise GatewayError("unavailable")
                         async for line in response_lines(response):
@@ -96,16 +111,34 @@ class Ollama:
                             if content:
                                 yield content
                             if item.get("done") is True:
-                                # Reaching num_predict is a valid Ollama completion.
-                                # Structured output still requires Pydantic validation.
                                 reason = item.get("done_reason")
                                 safe_reason = reason if reason in ("stop", "length") else "other"
-                                logger.info("ollama_stream_done reason=%s", safe_reason)
+                                prompt_tokens, output_tokens = (
+                                    value if type(value) is int and value >= 0 else None
+                                    for value in (
+                                        item.get("prompt_eval_count"), item.get("eval_count"),
+                                    )
+                                )
+                                logger.info(
+                                    "ollama_stream_done reason=%s prompt_tokens=%s "
+                                    "output_tokens=%s duration_ms=%.0f",
+                                    safe_reason, prompt_tokens, output_tokens,
+                                    (perf_counter() - started) * 1000,
+                                )
+                                if schema is not None and reason == "length":
+                                    raise _StructuredOutputLimit
                                 return
+                        logger.warning("ollama_stream_eof duration_ms=%.0f", (
+                            perf_counter() - started
+                        ) * 1000)
                         raise GatewayError("interrupted")
         except (TimeoutError, httpx.TimeoutException):
+            logger.warning("ollama_timeout duration_ms=%.0f", (perf_counter() - started) * 1000)
             raise GatewayError("timeout") from None
         except httpx.HTTPError:
+            logger.warning("ollama_transport_error duration_ms=%.0f", (
+                perf_counter() - started
+            ) * 1000)
             raise GatewayError("unavailable") from None
         except (ValueError, TypeError, AttributeError):
             raise GatewayError("invalid_response") from None
@@ -122,17 +155,26 @@ class Gateway:
         return "".join([part async for part in self.stream(messages)])
 
     async def structured(self, messages: list[dict[str, str]], model: type[T]) -> T:
-        parts = self.provider.stream(messages, model.model_json_schema())
-        text = "".join([part async for part in parts])
+        parts: list[str] = []
+        reached_limit = False
         try:
-            return model.model_validate_json(text)
-        except ValidationError:
-            raise GatewayError("invalid_structure") from None
+            async for part in self.provider.stream(messages, model.model_json_schema()):
+                parts.append(part)
+        except _StructuredOutputLimit:
+            reached_limit = True
+        try:
+            return model.model_validate_json("".join(parts))
+        except ValidationError as error:
+            truncated = reached_limit and any(
+                item["type"] == "json_invalid" for item in error.errors(include_input=False)
+            )
+            code = "structured_output_truncated" if truncated else "invalid_structure"
+            raise GatewayError(code) from None
 
 
-def gateway(settings: Settings, provider: str = "ollama") -> Gateway:
+def gateway(settings: Settings, provider: str | None = None) -> Gateway:
     # Future OpenAI/DeepSeek/YandexGPT/GigaChat adapters must implement Provider.
     # No registry, SDK, credentials, fallback or external network path exists today.
-    if provider != "ollama":
+    if (settings.llm_provider if provider is None else provider) != "ollama":
         raise GatewayError("provider_disabled")
     return Gateway(Ollama(settings))

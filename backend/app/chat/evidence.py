@@ -52,9 +52,10 @@ _VARIANT = re.compile(
     r"|p\.[a-z]{3}\d+[a-z]{3})(?!\w)",
     re.I,
 )
+_HEMOGLOBIN = r"гемоглобин(?:а|у|ом|е|ы|ов|ам|ами|ах)?"
 _INDICATORS = re.compile(
-    r"(?<!\w)(?:(?P<hba1c>hba1c|гликированн\w* гемоглобин\w*|glycated hemoglobin|"
-    r"(?:гемоглобин\w*|hemoglobin) a1[cс])|(?P<hgb>hgb|гемоглобин\w*|hemoglobin)|"
+    rf"(?<!\w)(?:(?P<hba1c>hba1c|гликированн\w* {_HEMOGLOBIN}|glycated hemoglobin|"
+    rf"(?:{_HEMOGLOBIN}|hemoglobin) a1[cс])|(?P<hgb>hgb|{_HEMOGLOBIN}|hemoglobin)|"
     r"(?P<tsh>ттг|tsh|тиреотропн\w* гормон\w*|thyroid-stimulating hormone)|"
     r"(?P<potassium>кали[йяюеи]|potassium)|(?P<sodium>натри[йяюеи]|sodium)|"
     r"(?P<calcium>кальци[йяюеи]|calcium)|(?P<magnesium>магни[йяюеи]|magnesium)|"
@@ -152,6 +153,15 @@ _LIST_INDICATORS = re.compile(
     r"\b(?:(?:перечисл\w*|список|перечень|какие) (?:все )?(?:лабораторн\w* )?показател\w*|"
     r"(?:list|which|what) (?:lab )?(?:markers|indicators|analytes))\b"
 )
+_EXPLANATION_INTENT = re.compile(
+    r"\b(?:объясни\w*|расшифруй\w*|проанализируй\w*|почему|что (?:это )?означа\w*|"
+    r"explain|what (?:do|does)\b.*\bmean)\b"
+)
+_DOCUMENT_CONTEXT = re.compile(
+    r"\b(?:(?P<conclusion>заключени\w*(?: (?:врача|специалиста))?|findings|impression|conclusion)|"
+    r"(?P<history>анамнез\w*|medical history)|(?P<notes>примечани\w*|notes?))\b"
+)
+SECTION_LABELS = {"conclusion": "Заключение", "history": "Анамнез", "notes": "Примечания"}
 _SUMMARY = re.compile(
     r"\b(?:резюм\w*|сделай кратк\w* обзор|кратко перескажи|"
     r"что в (?:документе|анализе|файле)|"
@@ -217,9 +227,11 @@ def overview_kind(question: str) -> Overview | None:
         return "comparison"
     if re.search(
         r"\b(?:(?:объясни\w*|проанализируй\w*) результаты|расшифруй\w*|референс\w*|"
-        r"выходят за норму|explain (?:the |my )?results|reference ranges?)\b",
+        r"explain (?:the |my )?results|reference ranges?)\b",
         query,
     ):
+        return "results"
+    if wants_explanation(query) and indicator_names(query):
         return "results"
     if _LIST_INDICATORS.search(query):
         return "indicators"
@@ -244,6 +256,44 @@ def indicator_names(text: str) -> list[tuple[str, str]]:
 def indicator_key(text: str) -> str | None:
     match = _INDICATORS.fullmatch(normalized(text))
     return match.lastgroup if match else None
+
+
+def wants_explanation(question: str) -> bool:
+    return bool(_EXPLANATION_INTENT.search(normalized(question)))
+
+
+def document_section(text: str, *, heading: bool = False) -> str | None:
+    query = normalized(text).strip()
+    match = _DOCUMENT_CONTEXT.fullmatch(query) if heading else _DOCUMENT_CONTEXT.search(query)
+    if match is None or (not heading and _ASKS_DATE.search(query)):
+        return None
+    return match.lastgroup
+
+
+def direct_indicators(question: str) -> set[str]:
+    """Recognize measurement lookups without discarding query constraints."""
+    query = normalized(question)
+    keys = {key for key, _ in indicator_names(query)}
+    rest = _INDICATORS.sub(" ", query)
+    if not keys or _ASKS_DATE.search(rest):
+        return set()
+    if re.search(r"\d", rest) or _UNIT.search(rest) or _GENE.search(rest) or _VARIANT.search(rest):
+        return set()
+    return keys
+
+
+def fact_lookup(question: str) -> bool:
+    query = normalized(question).strip()
+    if _GENE.search(query) or _ASKS_DATE.search(query):
+        return True
+    indicators = indicator_names(query)
+    asks_for_value = re.match(
+        r"(?:сколько|как(?:ой|ая|ое|ие)|покажи|назови|what is|what are|how much)\b", query,
+    )
+    return bool(
+        (indicators or _EXACT_INTENT.search(query))
+        and (asks_for_value or (_QUESTION_NUMBER.search(query) and indicators))
+    )
 
 
 def date_values(text: str) -> set[date] | None:

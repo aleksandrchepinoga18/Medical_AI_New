@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from uuid import uuid4
 
@@ -7,12 +8,15 @@ import pytest
 from app.chat.document_context import (
     Extraction,
     excerpt_payload,
+    legacy_deviations,
     overview_context,
     page_measurements,
+    section_excerpt,
 )
 from app.chat.evidence import (
     CONFLICT,
     MISSING,
+    direct_indicators,
     document_reference,
     evidence_statements,
     indicator_names,
@@ -22,8 +26,12 @@ from app.chat.evidence import (
     select_evidence,
 )
 from app.chat.lab_tables import table_measurements
+from app.chat.structured_context import measurement_mode
 from app.documents.extract import extract_pdf
+from app.documents.extraction_data import ExtractionResult
 from app.documents.models import Document, DocumentTextVersion
+from app.documents.providers import local_report
+from evaluation.extraction_fixtures import load_fixtures, render
 
 
 def hit(text, *, page=1, filename="synthetic.pdf"):
@@ -88,6 +96,62 @@ def test_numbered_overview_requests_route_separately_from_exact_lookup(question,
     assert needs_documents(question)
     assert overview_kind(question) == kind
     assert document_reference(question)[0] == numbers
+
+
+def test_deviations_take_priority_over_indicator_inventory():
+    question = "Какие показатели документа №3 выходят за пределы нормы?"
+    assert overview_kind(question) == "indicators"
+    assert measurement_mode(question, overview_kind(question)) == "deviations"
+
+
+@pytest.mark.parametrize("form", ["гемоглобин", "гемоглобина", "гемоглобином", "гемоглобине"])
+def test_direct_measurement_reuses_indicator_aliases(form):
+    _, question = document_reference(f"Какой уровень {form} в документе №3?")
+    assert direct_indicators(question) == {"hgb"}
+    assert not direct_indicators(question + " 21.11.2026")
+    assert not direct_indicators("Что сказано о гемоглобинурии?")
+
+
+def test_named_measurement_explanation_resolves_multiple_declined_indicators():
+    question = "Что означают показатели гемоглобина, лейкоцитов и глюкозы в документе №3?"
+    reference, remainder = document_reference(question)
+    assert reference == (3,) and overview_kind(question) == "results"
+    assert direct_indicators(remainder) == {"hgb", "wbc", "glucose"}
+
+
+def test_grid_pdf_confirms_measurements_and_has_no_conclusion(tmp_path):
+    fixture = next(item for item in load_fixtures() if item.id == "01-grid")
+    pdf, _ = render(fixture)
+    path = tmp_path / "01-grid.pdf"
+    path.write_bytes(pdf)
+    extracted = ExtractionResult.model_validate_json(json.dumps(
+        extract_pdf(path, 2, 10000, include_tables=True),
+    ))
+    extraction = Extraction(
+        Document(id=uuid4(), document_number=3, original_filename=path.name),
+        DocumentTextVersion(
+            id=uuid4(), normalized_text=extracted.text, locators=extracted.locators,
+        ),
+    )
+    assert section_excerpt(extraction, "conclusion") is None
+    rows = local_report(extracted.table_rows, extracted.tables_truncated).measurements
+    assert [row.name for row in rows] == ["Гемоглобин", "Лейкоциты", "Глюкоза"]
+
+
+def test_legacy_deviations_reuses_text_measurements():
+    text = "Гемоглобин: 132 г/л (референс 120–160).\nГлюкоза: 6,1 ммоль/л (референс 3,9–5,5)."
+    extraction = Extraction(
+        Document(id=uuid4(), document_number=3, original_filename="synthetic.pdf"),
+        DocumentTextVersion(
+            id=uuid4(), normalized_text=text,
+            locators=[{"kind": "page", "index": 1, "start": 0, "end": len(text)}],
+        ),
+    )
+    deviations = legacy_deviations(extraction, "Какие показатели выходят за норму?", 1000)
+    assert deviations.answer and "6,1" in deviations.answer and "132" not in deviations.answer
+    normal = legacy_deviations(extraction, "Гемоглобин вне нормы?", 1000)
+    assert normal.answer == "В сопоставимых записях отклонений не найдено."
+    assert normal.supporting_hits
 
 
 def test_indicator_inventory_distinguishes_mentions_from_results():

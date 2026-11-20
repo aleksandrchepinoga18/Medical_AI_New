@@ -1,7 +1,9 @@
 """Document ingestion and personal indexing share the existing broker and worker."""
 
+import logging
+
 from celery import Celery
-from celery.signals import worker_process_init, worker_ready, worker_shutdown
+from celery.signals import after_setup_logger, worker_process_init, worker_ready, worker_shutdown
 from kombu import Queue
 
 from app.core.config import Settings
@@ -53,6 +55,10 @@ celery_app.task(
 dispatcher: OutboxDispatcher | None = None
 
 
+def enable_gigachat_stage_logs(**kwargs: object) -> None:
+    logging.getLogger("app.documents.gigachat").setLevel(logging.INFO)
+
+
 def start_outbox(**kwargs: object) -> None:
     from uuid import UUID
 
@@ -93,6 +99,7 @@ def reset_connections(**kwargs: object) -> None:
         get_engine.cache_clear()
 
 
+after_setup_logger.connect(enable_gigachat_stage_logs, weak=False)
 worker_ready.connect(start_outbox, weak=False)
 worker_shutdown.connect(stop_outbox, weak=False)
 worker_process_init.connect(reset_connections, weak=False)

@@ -91,6 +91,10 @@ class DocumentTextVersion(Base):
         UniqueConstraint("document_id", "version", name="uq_document_text_version"),
         CheckConstraint("version > 0", name="ck_document_text_version"),
         CheckConstraint("jsonb_typeof(locators) = 'array'", name="ck_document_text_locators"),
+        CheckConstraint(
+            "jsonb_typeof(structured_result) = 'object'",
+            name="ck_document_structured_result",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
@@ -98,6 +102,7 @@ class DocumentTextVersion(Base):
     version: Mapped[int] = mapped_column(Integer)
     normalized_text: Mapped[str] = mapped_column(Text)
     locators: Mapped[list[dict[str, Any]]] = mapped_column(JSONB)
+    structured_result: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))
     extractor_version: Mapped[str] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()")
@@ -119,6 +124,10 @@ class DocumentIngestionJob(Base):
             "(lease_token IS NULL) = (lease_expires_at IS NULL)",
             name="ck_document_job_lease",
         ),
+        CheckConstraint(
+            "jsonb_typeof(external_request) = 'object'",
+            name="ck_document_job_external_request",
+        ),
         Index("ix_document_jobs_status_available", "status", "available_at"),
         Index("ix_document_jobs_lease_expires", "lease_expires_at"),
     )
@@ -134,6 +143,7 @@ class DocumentIngestionJob(Base):
     lease_token: Mapped[UUID | None]
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_code: Mapped[str | None] = mapped_column(String(64))
+    external_request: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()")
     )

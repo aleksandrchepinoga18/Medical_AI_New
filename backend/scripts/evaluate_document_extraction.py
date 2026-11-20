@@ -5,7 +5,6 @@ import asyncio
 import hashlib
 import json
 import os
-import ssl
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -19,10 +18,16 @@ import httpx
 from pydantic import SecretStr, TypeAdapter
 
 from app.documents.extract import ExtractionError
+from app.documents.gigachat import (
+    MODELS,
+    PROMPT,
+    GigaChatExtraction,
+    GigaChatResult,
+    gigachat_tls_context,
+)
 from evaluation.extraction_fixtures import CORPUS_VERSION, MANIFEST, Evidence, load_fixtures, render
 from evaluation.extraction_metrics import count_matches, score
 from evaluation.extraction_tracking import register
-from evaluation.gigachat_extraction import MODELS, GigaChatExtraction, GigaChatResult
 from evaluation.local_extraction import flat_text, native_tables
 
 REPORT_VERSION = 2
@@ -159,9 +164,7 @@ async def compare(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         if not credentials:
             parser.error("set GIGACHAT_CREDENTIALS before requesting GigaChat")
         try:
-            context = ssl.create_default_context()
-            if ca_bundle := os.environ.get("GIGACHAT_CA_BUNDLE"):
-                context.load_verify_locations(cafile=ca_bundle)
+            context = gigachat_tls_context(os.environ.get("GIGACHAT_CA_BUNDLE"))
         except (OSError, ValueError):
             parser.error("could not load GigaChat CA certificates")
     try:
@@ -191,6 +194,7 @@ async def compare(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         adapter = (
             GigaChatExtraction(
                 client, SecretStr(credentials), args.gigachat_model, args.gigachat_mode,
+                prompt=PROMPT.replace("приложенного PDF", "приложенного синтетического PDF", 1),
             )
             if args.gigachat_model else None
         )

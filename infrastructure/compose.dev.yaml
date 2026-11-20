@@ -19,14 +19,13 @@ services:
       HOSTNAME: 0.0.0.0
       PORT: "3000"
     volumes:
-      # Keep image dependencies and the writable build cache outside host mounts.
+      # Keep dependencies, the build cache, and generated next-env.d.ts inside the container.
       - ../frontend/app:/app/app
       - ../frontend/tests:/app/tests:ro
       - ../frontend/components:/app/components:ro
       - ../frontend/lib:/app/lib:ro
       - ../frontend/next.config.ts:/app/next.config.ts:ro
       - ../frontend/tsconfig.json:/app/tsconfig.json
-      - ../frontend/next-env.d.ts:/app/next-env.d.ts
       - ../frontend/eslint.config.mjs:/app/eslint.config.mjs:ro
 
 # Legacy volumes are retained but no longer mounted by frontend.

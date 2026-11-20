@@ -46,9 +46,15 @@ class Settings(BaseSettings):
     documents_upload_grace_seconds: int = Field(default=300, ge=120, le=3600)
     documents_outbox_interval: int = Field(default=5, ge=1, le=60)
     documents_outbox_enabled: bool = True
+    documents_extraction_provider: Literal["pymupdf_tables", "gigachat_ultra"] = "pymupdf_tables"
+    gigachat_credentials: SecretStr = SecretStr("")
+    gigachat_scope: Literal["GIGACHAT_API_PERS"] = "GIGACHAT_API_PERS"
+    gigachat_model: Literal["GigaChat-3-Ultra"] = "GigaChat-3-Ultra"
+    gigachat_ca_bundle: str = ""
     rag_enabled: bool = False
     rag_retrieval_mode: Literal["dense", "hybrid"] = "dense"
     chat_enabled: bool = False
+    llm_provider: Literal["ollama"] = "ollama"
     llm_model: str = "qwen2.5:7b-instruct"
     llm_ollama_url: Literal["http://ollama:11434", "http://host.docker.internal:11434"] = (
         "http://ollama:11434"

@@ -19,15 +19,26 @@ from starlette.types import Receive, Scope, Send
 
 from app.auth.routes import DB, AuthenticatedUser
 from app.db import get_settings
-from app.documents.models import Document, DocumentTextVersion
+from app.documents.gigachat import UPLOAD_BYTES
+from app.documents.models import Document, DocumentIngestionJob, DocumentTextVersion
 from app.documents.schemas import (
+    EXTERNAL_UNRESOLVED,
+    VERSION_REQUEST,
     DocumentDetails,
     DocumentList,
     DocumentListItem,
     DocumentView,
+    ExternalExtractionInput,
+    ExternalExtractionView,
     TextVersionView,
 )
-from app.documents.service import create_upload, owned_document, retry_document
+from app.documents.service import (
+    authorize_external,
+    create_upload,
+    owned_document,
+    refresh_local,
+    retry_document,
+)
 from app.integrations.object_storage import (
     CONTENT_TYPES,
     ObjectStorage,
@@ -257,19 +268,44 @@ def details(
     )
     result = DocumentDetails.model_validate(document)
     result.text_version = TextVersionView.model_validate(version) if version else None
+    if version is not None:
+        jobs = (
+            select(DocumentIngestionJob)
+            .where(DocumentIngestionJob.document_id == document.id)
+            .order_by(DocumentIngestionJob.version.desc()).limit(1)
+        )
+        provider = DocumentIngestionJob.external_request["provider"].as_string()
+        for name, field in (
+            ("pymupdf_tables", "local_refresh"), ("gigachat_ultra", "external_extraction"),
+        ):
+            job = db.scalar(jobs.where(provider == name))
+            if job is not None:
+                view = extraction_job_view(job)
+                if view.text_version == version.version or (
+                    name == "pymupdf_tables" and job.version == version.version
+                ) or view.error_code in EXTERNAL_UNRESOLVED:
+                    setattr(result, field, view)
+    result.external_extraction_enabled = (
+        get_settings().documents_extraction_provider == "gigachat_ultra"
+        and document.format == "pdf"
+        and document.size_bytes <= UPLOAD_BYTES
+    )
     response.headers["Cache-Control"] = "no-store"
     return result
 
 
 class OriginalResponse(StreamingResponse):
-    def __init__(self, stream: Iterator[bytes], first: bytes, headers: dict[str, str]) -> None:
+    def __init__(
+        self, stream: Iterator[bytes], first: bytes, headers: dict[str, str],
+        media_type: str = "application/octet-stream",
+    ) -> None:
         self.original_stream = stream
 
         def chunks() -> Iterator[bytes]:
             yield first
             yield from stream
 
-        super().__init__(chunks(), headers=headers, media_type="application/octet-stream")
+        super().__init__(chunks(), headers=headers, media_type=media_type)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
@@ -283,7 +319,10 @@ class OriginalResponse(StreamingResponse):
 
 
 @router.get("/{document_id}/download")
-def download(document_id: UUID, user: AuthenticatedUser, db: DB, storage: Storage) -> Response:
+def download(
+    document_id: UUID, user: AuthenticatedUser, db: DB, storage: Storage,
+    inline: bool = False,
+) -> Response:
     document = owned_document(db, document_id, user.id)
     if document.status == "uploading" or document.error_code in {
         "UPLOAD_INCOMPLETE",
@@ -293,8 +332,10 @@ def download(document_id: UUID, user: AuthenticatedUser, db: DB, storage: Storag
         raise HTTPException(409, "Original upload is not confirmed")
     owner_id, object_key = user.id, document.object_key
     filename = quote(document.original_filename, safe="")
+    preview = inline and document.format == "pdf"
+    disposition = "inline" if preview else "attachment"
     headers = {
-        "Content-Disposition": f"attachment; filename*=UTF-8''{filename}",
+        "Content-Disposition": f"{disposition}; filename*=UTF-8''{filename}",
         "Content-Type": CONTENT_TYPES[document.format],
         "Content-Length": str(document.size_bytes),
         "Cache-Control": "no-store",
@@ -308,7 +349,8 @@ def download(document_id: UUID, user: AuthenticatedUser, db: DB, storage: Storag
         raise HTTPException(404, "Original not found") from None
     except (StorageError, StopIteration):
         raise HTTPException(503, "Original is temporarily unavailable") from None
-    return OriginalResponse(stream, first, headers)
+    media_type = "application/pdf" if preview else "application/octet-stream"
+    return OriginalResponse(stream, first, headers, media_type)
 
 
 @router.post("/{document_id}/retry", status_code=202, response_model=DocumentView)
@@ -316,3 +358,46 @@ def retry(document_id: UUID, response: Response, user: AuthenticatedUser, db: DB
     document = retry_document(db, document_id, user.id, get_settings())
     response.headers["Cache-Control"] = "no-store"
     return DocumentView.model_validate(document)
+
+
+def extraction_job_view(job: DocumentIngestionJob) -> ExternalExtractionView:
+    authorization = VERSION_REQUEST.validate_python(job.external_request)
+    return ExternalExtractionView(
+        job_id=job.id, status=job.status, error_code=job.error_code,
+        text_version=authorization.text_version,
+    )
+
+
+@router.post("/{document_id}/external-extraction", status_code=202)
+def request_external_extraction(
+    document_id: UUID, data: ExternalExtractionInput, response: Response,
+    user: AuthenticatedUser, db: DB,
+) -> ExternalExtractionView:
+    job = authorize_external(db, document_id, user.id, data, get_settings())
+    response.headers["Cache-Control"] = "no-store"
+    return extraction_job_view(job)
+
+
+@router.post("/{document_id}/refresh-extraction", status_code=202)
+def refresh_extraction(
+    document_id: UUID, response: Response, user: AuthenticatedUser, db: DB,
+) -> ExternalExtractionView:
+    job = refresh_local(db, document_id, user.id, get_settings())
+    response.headers["Cache-Control"] = "no-store"
+    return extraction_job_view(job)
+
+
+@router.get("/{document_id}/external-extraction/{job_id}")
+def external_extraction_status(
+    document_id: UUID, job_id: UUID, response: Response, user: AuthenticatedUser, db: DB,
+) -> ExternalExtractionView:
+    owned_document(db, document_id, user.id)
+    job = db.scalar(select(DocumentIngestionJob).where(
+        DocumentIngestionJob.id == job_id,
+        DocumentIngestionJob.document_id == document_id,
+        DocumentIngestionJob.external_request["provider"].as_string() == "gigachat_ultra",
+    ))
+    if job is None:
+        raise HTTPException(404, "External extraction not found")
+    response.headers["Cache-Control"] = "no-store"
+    return extraction_job_view(job)

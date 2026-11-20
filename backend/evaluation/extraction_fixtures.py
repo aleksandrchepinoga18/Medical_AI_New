@@ -5,7 +5,9 @@ from pathlib import Path
 from typing import Literal
 
 import pymupdf
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
+
+from app.documents.extraction_data import Evidence as Evidence
 
 MANIFEST = Path(__file__).with_name("document_extraction.json")
 CORPUS_VERSION = 2
@@ -14,30 +16,6 @@ HEADERS = {
     "en": ("Analyte", "Result", "Units", "Reference", "Date"),
 }
 COLUMNS = (42, 242, 334, 440, 559, 672)
-FIELDS = ("name", "value", "unit", "reference", "date")
-BBox = tuple[float, float, float, float]
-
-
-class Measurement(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    name: str = Field(min_length=1, max_length=240)
-    value: str = Field(min_length=1, max_length=80)
-    unit: str | None = Field(max_length=80)
-    reference: str | None = Field(max_length=160)
-    date: str | None = Field(max_length=60)
-    page: int | None = Field(ge=1)
-    quote: str | None = Field(max_length=1000)
-
-
-class Measurements(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    measurements: list[Measurement] = Field(max_length=100)
-
-
-class Evidence(Measurement):
-    bbox: BBox | None = None
 
 
 class FixturePage(BaseModel):

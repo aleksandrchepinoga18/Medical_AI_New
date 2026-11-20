@@ -1,7 +1,11 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { chatRequest, readChatStream } from "../lib/chat-api";
+import nextConfig from "../next.config";
 
 afterEach(() => vi.unstubAllGlobals());
+it("gives proxied chat time to return its own Ollama timeout", () => {
+  expect(nextConfig.experimental?.proxyTimeout).toBeGreaterThan(600_000);
+});
 it("reads fragmented UTF-8 stream", async () => {
   const bytes = new TextEncoder().encode('{"type":"delta","text":"ответ"}\n{"type":"done"}\n');
   const stream = new ReadableStream({ start(c) {

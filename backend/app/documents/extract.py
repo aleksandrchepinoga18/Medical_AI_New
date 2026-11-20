@@ -40,10 +40,15 @@ class TextBuilder:
         }
 
 
-def extract_pdf(path: Path, max_pages: int, max_chars: int) -> dict[str, object]:
+def extract_pdf(
+    path: Path, max_pages: int, max_chars: int, *, include_tables: bool = False,
+) -> dict[str, object]:
     import pymupdf
 
     builder = TextBuilder(max_chars)
+    table_rows: list[dict[str, object]] = []
+    tables_truncated = False
+    max_rows = 400
     with pymupdf.open(path) as document:
         if document.needs_pass:
             raise ExtractionError("PASSWORD_PROTECTED")
@@ -56,8 +61,25 @@ def extract_pdf(path: Path, max_pages: int, max_chars: int) -> dict[str, object]
                 raise ExtractionError("INVALID_DOCUMENT")
             empty_page = empty_page or not value.strip()
             builder.add(value, "page", number + 1)
+            if include_tables and value.strip() and not tables_truncated:
+                if len(table_rows) >= max_rows:
+                    tables_truncated = True
+                    continue
+                from app.documents.tables import page_measurements
+
+                try:
+                    rows, _ = page_measurements(page)
+                    remaining = max_rows - len(table_rows)
+                    table_rows.extend(row.model_dump(mode="json") for row in rows[:remaining])
+                    tables_truncated |= len(rows) > remaining
+                except Exception:
+                    # Preserve the text and locators when a page's table detection fails.
+                    tables_truncated = True
     # Without OCR a blank or scanned page cannot be claimed as fully processed.
-    return builder.result(needs_ocr=empty_page or not builder.parts)
+    result = builder.result(needs_ocr=empty_page or not builder.parts)
+    if include_tables:
+        result.update(table_rows=table_rows, tables_truncated=tables_truncated)
+    return result
 
 
 def extract_docx(path: Path, max_chars: int, max_unpacked: int) -> dict[str, object]:
@@ -114,7 +136,7 @@ def main() -> None:
         resource.setrlimit(resource.RLIMIT_FSIZE, (output_limit, output_limit))
     try:
         if format_ == "pdf":
-            result = extract_pdf(Path(source), int(pages), int(chars))
+            result = extract_pdf(Path(source), int(pages), int(chars), include_tables=True)
         elif format_ == "docx":
             result = extract_docx(Path(source), int(chars), int(unpacked))
         else:

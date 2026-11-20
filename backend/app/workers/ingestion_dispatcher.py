@@ -36,12 +36,18 @@ def dispatch_once(engine: Engine, publish: Callable[[UUID], None], settings: Set
         )
         if job is None:
             return False
-        if job.attempts >= settings.documents_max_attempts:
+        interrupted_external = (
+            job.external_request is not None
+            and job.external_request.get("provider") != "pymupdf_tables"
+            and job.status == "processing"
+        )
+        if interrupted_external or job.attempts >= settings.documents_max_attempts:
             document = db.scalar(
                 select(Document).where(Document.id == job.document_id).with_for_update(),
             )
             assert document is not None
-            fail_attempt(db, job, document, "RETRY_EXHAUSTED", settings, transient=False)
+            code = "EXTERNAL_INTERRUPTED" if interrupted_external else "RETRY_EXHAUSTED"
+            fail_attempt(db, job, document, code, settings, transient=False)
             db.commit()
             return True
         job.status = "pending"

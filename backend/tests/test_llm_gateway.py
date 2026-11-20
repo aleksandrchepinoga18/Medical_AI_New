@@ -201,16 +201,23 @@ def test_read_timeout_uses_configured_generation_deadline():
     assert asyncio.run(adapter(handler).generate([])) == "synthetic"
 
 
-def test_length_completion_still_validates_structured_output():
+@pytest.mark.parametrize(("content", "reason", "code"), [
+    ('{"count":', "length", "structured_output_truncated"),
+    ('{"count":', "stop", "invalid_structure"),
+    ('{"count":"bad"}', "length", "invalid_structure"),
+    ('{"count":2}', "length", None),
+])
+def test_structured_completion_distinguishes_truncation(content, reason, code):
     def handler(request):
-        return httpx.Response(
-            200,
-            content=b'{"message":{"content":"{unfinished"}}\n'
-            b'{"done":true,"done_reason":"length"}\n',
-        )
+        part = json.dumps({"message": {"content": content}})
+        end = json.dumps({"done": True, "done_reason": reason})
+        return httpx.Response(200, content=f"{part}\n{end}\n".encode())
 
-    with pytest.raises(GatewayError, match="invalid_structure"):
-        asyncio.run(adapter(handler).structured([], Result))
+    if code is None:
+        assert asyncio.run(adapter(handler).structured([], Result)).count == 2
+    else:
+        with pytest.raises(GatewayError, match=f"^{code}$"):
+            asyncio.run(adapter(handler).structured([], Result))
 
 
 def test_cancellation_propagates():

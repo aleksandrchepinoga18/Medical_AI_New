@@ -38,8 +38,9 @@ export function PersonalChat() {
       }
     }
     void loadDialogs();
-    return () => { load.abort(); controller.current?.abort(); };
+    return () => load.abort();
   }, [report]);
+  useEffect(() => () => controller.current?.abort(), []);
   async function send() {
     if (!selected || !input.trim() || active.current) return;
     active.current = true; setBusy(true); setError(""); setPartial("");
@@ -91,7 +92,7 @@ export function PersonalChat() {
             <p className="whitespace-pre-wrap">{m.content}</p>
             {m.status !== "complete" && <p>Попытка: {m.status}</p>}
             {m.sources.map((s, i) => <div key={i}>
-              <a className="underline" href={s.source_url}>{s.document_number !== undefined && `№ ${s.document_number} · `}{s.filename}</a>
+              <a className="underline" href={s.source_url}>{s.source_id && `[${s.source_id}] `}{s.document_number !== undefined && `№ ${s.document_number} · `}{s.filename}</a>
               {s.sources.map((p, j) => <span key={j}> · {p.kind} {p.index}</span>)}
             </div>)}
           </article>)}
