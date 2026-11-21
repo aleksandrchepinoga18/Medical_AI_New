@@ -1,7 +1,19 @@
 "use client";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { chatRequest, readChatStream, type ChatMessage, type Conversation } from "../lib/chat-api";
+import {
+  ChatHttpError, chatRequest, readChatStream, type ChatHistory, type ChatMessage, type Conversation,
+} from "../lib/chat-api";
+
+type ActiveModel = { provider: "ollama" | "gigachat"; name: string };
+
+function activeModel(data: ChatHistory): ActiveModel | null {
+  const { llm_provider: provider, llm_model: name } = data;
+  if ((provider === "ollama" || provider === "gigachat") && typeof name === "string" && name.trim()) {
+    return { provider, name };
+  }
+  return null;
+}
 
 export function PersonalChat() {
   const router = useRouter();
@@ -12,19 +24,31 @@ export function PersonalChat() {
   const [partial, setPartial] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [model, setModel] = useState<ActiveModel | null>(null);
+  const [externalConsent, setExternalConsent] = useState(false);
   const controller = useRef<AbortController | null>(null);
   const active = useRef(false);
-  const report = useCallback((e: unknown) => {
+  const report = useCallback((e: unknown, keepPrevious = false) => {
     const message = e instanceof Error ? e.message : "Ошибка чата";
-    if (message.includes("401")) router.replace("/login");
-    setError(message.includes("503") ? "Чат отключён или локальный сервис недоступен." : message);
+    const status = e instanceof ChatHttpError ? e.status : null;
+    if (status === 401) router.replace("/login");
+    setError(previous => keepPrevious && previous ? previous : (
+      status === 503 ? "Чат отключён или сервис недоступен." : message
+    ));
   }, [router]);
   async function refresh(signal?: AbortSignal) {
     setDialogs(await (await chatRequest("", "GET", undefined, signal)).json());
   }
+  async function loadHistory(id: string) {
+    const data: ChatHistory = await (await chatRequest(`/${id}`)).json();
+    setModel(activeModel(data));
+    setMessages(data.messages);
+    setPartial("");
+  }
   async function open(dialog: Conversation) {
-    const data = await (await chatRequest(`/${dialog.id}`)).json();
-    setSelected(dialog); setMessages(data.messages); setPartial(""); setError("");
+    await loadHistory(dialog.id);
+    setExternalConsent(false);
+    setSelected(dialog); setError("");
   }
   useEffect(() => {
     const load = new AbortController();
@@ -42,11 +66,17 @@ export function PersonalChat() {
   }, [report]);
   useEffect(() => () => controller.current?.abort(), []);
   async function send() {
-    if (!selected || !input.trim() || active.current) return;
+    if (!selected || !model || !input.trim() || active.current ||
+        (model.provider === "gigachat" && !externalConsent)) {
+      return;
+    }
+    const body = model.provider === "gigachat"
+      ? { content: input, external_consent: "gigachat" } : { content: input };
+    setExternalConsent(false);
     active.current = true; setBusy(true); setError(""); setPartial("");
     const abort = new AbortController(); controller.current = abort;
     try {
-      const response = await chatRequest(`/${selected.id}/messages`, "POST", { content: input }, abort.signal);
+      const response = await chatRequest(`/${selected.id}/messages`, "POST", body, abort.signal);
       await readChatStream(response, event => {
         if (event.type === "delta") setPartial(old => old + (event.text ?? ""));
       });
@@ -55,8 +85,12 @@ export function PersonalChat() {
       if (abort.signal.aborted) setError("Генерация остановлена. Неполный ответ не сохранён.");
       else report(e);
     } finally {
-      try { const data = await (await chatRequest(`/${selected.id}`)).json();
-        setMessages(data.messages); setPartial(""); } catch (e) { report(e); }
+      try {
+        await loadHistory(selected.id);
+      } catch (e) {
+        setModel(null);
+        report(e, true);
+      }
       setBusy(false); active.current = false; controller.current = null;
     }
   }
@@ -85,7 +119,10 @@ export function PersonalChat() {
             try { await chatRequest(`/${selected.id}`, "DELETE");
               setSelected(null); setMessages([]); await refresh(); } catch (e) { report(e); }
           }}>Удалить</button></div>
-        <p>Локальная модель может ошибаться. Источники — найденный контекст; проверяйте выводы по документам.</p>
+        {model
+          ? <p>Активная модель — {model.provider === "ollama" ? `Ollama / ${model.name}` : model.name}</p>
+          : <p role="status">Не удалось определить активную модель. Откройте диалог заново.</p>}
+        <p>Модель может ошибаться. Сверяйте выводы с указанными источниками.</p>
         <div aria-live="polite" className="space-y-4">
           {messages.map(m => <article className="rounded border p-4" key={m.id}>
             <strong>{m.role === "user" ? "Вы" : "Помощник"}</strong>
@@ -102,7 +139,16 @@ export function PersonalChat() {
           <label className="block" htmlFor="chat-input">Сообщение</label>
           <textarea className="w-full rounded border p-3" id="chat-input" maxLength={2000}
             value={input} disabled={busy} onChange={e => setInput(e.target.value)} />
-          <button disabled={busy || !input.trim()}>Отправить</button>
+          {model?.provider === "gigachat" && <label className="flex items-start gap-2">
+            <input type="checkbox" checked={externalConsent} disabled={busy}
+              onChange={e => setExternalConsent(e.target.checked)} />
+            <span>Разрешаю отправить в облачный GigaChat это сообщение, относящиеся к нему
+              реплики этого диалога и данные выбранных инструментами документов.</span>
+          </label>}
+          <button disabled={!model || busy || !input.trim() ||
+            (model.provider === "gigachat" && !externalConsent)}>
+            Отправить
+          </button>
           {busy && <button type="button" onClick={() => controller.current?.abort()}>Остановить</button>}
         </form>
       </>}

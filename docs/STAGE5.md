@@ -1,4 +1,4 @@
-# Этап 5: локальный LLM Gateway и персональный чат
+# Этап 5 — LLM Gateway и персональный чат
 
 Статус: реализация подготовлена, запуск и приёмка пользователем ещё не выполнены.
 Рабочий `.env` не изменён. Чат выключен по умолчанию (`CHAT_ENABLED=false`).
@@ -11,10 +11,9 @@ Next.js `/chat` → авторизованный `/chat` API → агентны�
 `http://host.docker.internal:11434/api/chat`, embeddings остаются в Docker Ollama.
 Новых коллекций, embedding-моделей и сервисов нет.
 Gateway предоставляет generate, stream, структурированный вывод и поток native tool calls.
-Protocol Provider допускает
-будущие адаптеры OpenAI, DeepSeek, YandexGPT, GigaChat; factory сейчас отклоняет
-все провайдеры кроме Ollama. URL клиента отсутствует, proxy environment и redirects
-в HTTP-клиенте отключены. Для чата разрешены только штатные локальные адреса RAG.
+Один Agent Loop работает с Ollama и GigaChat-3-Ultra. RAG использует локальные
+адреса в обоих режимах. URL облачного API закреплён в адаптере, HTTP-клиенты
+отключают прокси из окружения и не переходят по перенаправлениям.
 `httpx==0.28.1` перенесён из dev в runtime: нужен для асинхронного streaming и отмены;
 новый SDK или новая версия зависимости не добавлены.
 
@@ -67,8 +66,260 @@ Qwen получает завершённую историю в пределах 
 
 На старом Ollama текст при передаче `tools` может прийти в одном блоке.
 Контур использует тот же NDJSON-поток и выдаёт ответ после проверки источников.
-На вход модели поступают только данные, нужные для заданного вопроса, через
-настроенный локальный endpoint. Чат не выдаёт диагнозов или назначений лечения.
+На вход модели поступают вопрос, релевантные завершённые реплики текущего
+диалога и данные вызванных инструментов. Чат не выдаёт диагнозов или
+назначений лечения.
+
+## GigaChat-3-Ultra
+
+Оба адаптера возвращают в Agent Loop один тип событий для текста и инструментов.
+GigaChat использует SSE на `/v1/chat/completions` и сохраняет
+`functions_state_id` в пределах текущей генерации. Результат инструмента
+передаётся сообщением `function` с именем и JSON. OAuth и проверка TLS используют
+существующий код извлечения. Токен переиспользуется в рамках одной генерации.
+При первом HTTP 401 адаптер обновляет токен и повторяет запрос один раз.
+[Функции GigaChat](https://developers.sber.ru/docs/ru/gigachat/guides/functions/generating-arguments-for-custom-functions)
+· [Поток SSE](https://developers.sber.ru/docs/ru/gigachat/guides/response-token-streaming)
+· [OAuth](https://developers.sber.ru/docs/ru/gigachat/api/reference/rest/post-token).
+
+По умолчанию выбран Ollama. При настройке GigaChat пользователь подтверждает
+каждое облачное отправление. Согласие включает сообщение, относящуюся к нему
+историю этого диалога и данные выбранных инструментами документов. Backend
+проверяет согласие до обращения к провайдеру. Согласие на извлечение PDF здесь
+не действует. Агент передаёт выдержки и измерения из инструментов, а оригинал PDF
+остаётся в хранилище. Источники проверяются перед сохранением ответа. При
+техническом сбое ответ формируется локально. Фильтрация GigaChat завершает
+запрос с кодом `gigachat_filtered`.
+
+В настройках облака окно приложения по умолчанию составляет 16 384 токена,
+лимит ответа — 2 048 токенов, дедлайн — 180 секунд. Эти параметры и бюджеты
+истории и результатов задаются отдельно от Ollama. Документация Ultra указывает
+максимальное окно модели в 128 тыс. токенов. Приложение использует меньшее
+начальное окно и консервативную оценку по UTF-8, чтобы ограничить объём передачи.
+Используется последовательный Function Calling API v1.
+[Контекст модели](https://developers.sber.ru/docs/ru/gigachat/models/updates)
+· [Метод генерации](https://developers.sber.ru/docs/ru/gigachat/api/reference/rest/post-chat).
+
+Настройки облака задаются через `LLM_GIGACHAT_CONTEXT_TOKENS`,
+`LLM_GIGACHAT_MAX_TOKENS`, `LLM_GIGACHAT_TIMEOUT_SECONDS`,
+`CHAT_GIGACHAT_HISTORY_CHARS` и `CHAT_GIGACHAT_CONTEXT_CHARS`.
+Для Ultra используется действующая авторизация `GIGACHAT_API_PERS`.
+
+### Переключение без пересборки
+
+В Git Bash из корня проекта используйте набор Compose-файлов текущего dev-стека.
+Пример для стандартного стека с локальным RAG и готовыми образами:
+
+```bash
+chat_compose=(--env-file .env
+  -f infrastructure/compose.yaml
+  -f infrastructure/compose.dev.yaml
+  -f infrastructure/compose.rag.yaml)
+dc() { docker compose "${chat_compose[@]}" "$@"; }
+gc() {
+  local cloud_compose=(-f infrastructure/compose.gigachat-chat.yaml)
+  MSYS2_ENV_CONV_EXCL=GIGACHAT_CA_BUNDLE docker compose "${chat_compose[@]}" "${cloud_compose[@]}" "$@"
+}
+read -rsp 'Ключ авторизации GigaChat: ' GIGACHAT_CREDENTIALS; printf '\n'
+export GIGACHAT_CREDENTIALS
+# Если дополнительно нужен PEM, задайте имя уже установленного сертификата.
+# export GIGACHAT_CA_BUNDLE=/run/gigachat-ca/russian_trusted_root_ca_pem.crt
+LLM_PROVIDER=gigachat gc config --quiet &&
+LLM_PROVIDER=gigachat gc up -d --no-deps --no-build --pull never --force-recreate --wait backend
+```
+
+При первом применении изменений чата пересоздайте также dev-frontend. Команда
+использует существующий образ `:development` и монтирует актуальные исходники.
+Frontend из старого runtime-образа содержит интерфейс на момент сборки.
+
+```bash
+gc up -d --no-deps --no-build --pull never --force-recreate --wait frontend
+```
+
+Если backend уже работает в GigaChat с dev bind mounts, сохраните его
+окружение и дождитесь автоперезагрузки либо выполните `gc restart backend`.
+Обновите вкладку чата и откройте диалог. Интерфейс читает
+`llm_provider` и `llm_model` из `GET /api/chat/{id}`.
+
+Проверьте два режима на синтетическом сообщении. В GigaChat отображается
+`GigaChat-3-Ultra`, а отправка требует отметки о согласии. После отметки запрос
+содержит `external_consent: "gigachat"`. При переключении с Ollama в открытой
+вкладке запрос без согласия получает `403 external_consent_required`.
+Чат отображает причину, загружает новое имя модели и сохраняет черновик.
+В Ollama отображается `Ollama / qwen2.5:7b-instruct` при стандартной модели,
+сообщение отправляется без облачного согласия.
+
+Вернуться на Ollama можно командой:
+
+```bash
+LLM_PROVIDER=ollama dc up -d --no-deps --no-build --pull never --force-recreate --wait backend
+unset GIGACHAT_CREDENTIALS GIGACHAT_CA_BUNDLE
+```
+
+### Синтетическая проверка Function Calling
+
+При включённом GigaChat выполните пробу. Она передаёт только фиктивный номер и код.
+
+```bash
+gc exec -T backend python - <<'PY'
+import asyncio
+from app.db import get_settings
+from app.llm.gateway import ToolCall, gateway
+
+async def main():
+    settings = get_settings()
+    assert settings.llm_provider == "gigachat"
+    model = gateway(settings, external_consent=True)
+    functions = [{"type": "function", "function": {
+        "name": "get_test_code", "description": "Return the synthetic code for a number.",
+        "parameters": {"type": "object", "properties": {"number": {"type": "integer"}},
+                       "required": ["number"]},
+    }}]
+    messages = [
+        {"role": "system", "content": "Call get_test_code first. Then return the code."},
+        {"role": "user", "content": "Get the synthetic test code for number 6."},
+    ]
+    events = [part async for part in model.tool_stream(messages, functions)]
+    (call,) = [part for part in events if isinstance(part, ToolCall)]
+    assert call.name == "get_test_code" and call.arguments == {"number": 6} and call.state_id
+    messages += [
+        {"role": "assistant", "content": "", "tool_calls": [call.message()]},
+        {"role": "tool", "tool_name": call.name, "content": '{"code":68427}'},
+    ]
+    final = [part async for part in model.tool_stream(messages, functions)]
+    assert all(isinstance(part, str) for part in final) and "68427" in "".join(final)
+    print("GigaChat Function Calling round trip OK")
+
+asyncio.run(main())
+PY
+```
+
+### Проверка схем инструментов GigaChat при HTTP 422
+
+Синтетическая проба отправляет простую схему одного аргумента. Реальный агент
+использует три описания из Pydantic. Они дополнительно содержат служебные
+поля и ограничения, в том числе верхнюю границу 64-битного номера документа.
+Адаптер GigaChat v1 отправляет типы, описания, перечни значений, свойства,
+обязательные поля и типы элементов массивов. Все ограничения аргументов
+сохраняются в Python. Порядок ролей и параметры генерации сохраняются.
+
+В журнале `gigachat_validation_rejected` выводит классифицированную причину
+отказа, число сообщений и функций, режим вызова и лимит токенов. Исходный
+ответ GigaChat и содержимое запроса в журнал не попадают. При переходе на
+резервный путь новый ответ сохраняется с пометкой «Резервный ответ · локальная обработка».
+
+При работающем облачном dev-backend сравните исходные схемы Pydantic и те же
+схемы после адаптации. Команда отправляет только статические описания
+инструментов в официальный `POST /v1/functions/validate`.
+[Валидатор функций](https://developers.sber.ru/docs/ru/gigachat/api/reference/rest/function-validation)
+· [Причины HTTP 422](https://developers.sber.ru/docs/ru/gigachat/api/errors-description).
+
+```bash
+gc exec -T backend python - <<'PY'
+import asyncio
+
+import httpx
+
+from app.chat.agent import tool_definitions
+from app.db import get_settings
+from app.documents.gigachat import API, GigaChatExtraction, gigachat_tls_context
+from app.llm.gigachat import gigachat_functions, validation_reason
+
+
+async def main():
+    settings = get_settings()
+    assert settings.gigachat_credentials.get_secret_value(), "GigaChat credentials required"
+    tools = tool_definitions()
+    variants = (("original", [tool["function"] for tool in tools]),
+                ("wire", gigachat_functions(tools)))
+    wire_ok = True
+    async with httpx.AsyncClient(
+        verify=gigachat_tls_context(settings.gigachat_ca_bundle),
+        trust_env=False, follow_redirects=False, timeout=30,
+    ) as client:
+        auth = GigaChatExtraction(
+            client, settings.gigachat_credentials, settings.gigachat_model,
+            "schema", scope=settings.gigachat_scope,
+        )
+        headers = await auth.headers(timeout=30)
+        for variant, functions in variants:
+            for function in functions:
+                response = await client.post(
+                    f"{API}/functions/validate", headers=headers, json=function,
+                )
+                try:
+                    parsed = response.json()
+                except ValueError:
+                    parsed = None
+                body = parsed if isinstance(parsed, dict) else {}
+                errors = body.get("errors") or []
+                warnings = body.get("warnings") or []
+                ok = (response.is_success and isinstance(parsed, dict)
+                      and body.get("status", response.status_code) == 200 and not errors)
+                print(variant, function["name"], f"http={response.status_code}",
+                      f"valid={ok}", f"reason={validation_reason(body)}",
+                      f"errors={len(errors)}", f"warnings={len(warnings)}")
+                if variant == "wire":
+                    wire_ok &= ok
+    assert wire_ok, "A GigaChat wire schema was rejected"
+
+
+asyncio.run(main())
+PY
+```
+
+Ожидается `valid=True` для всех трёх строк `wire`. Сопоставьте строки
+`original`, чтобы установить причину исходного отказа. Если обе версии
+проходят валидацию, повторите синтетический сценарий чата и проверьте
+`gigachat_validation_rejected` по идентификатору генерации.
+
+### Сравнение на документе №6
+
+Для каждого провайдера откройте новый диалог и последовательно задайте четыре
+вопроса по синтетическому `04-multipage.pdf`:
+
+1. Объясни результаты документа №6.
+2. Как изменился уровень креатинина?
+3. На сколько процентов он изменился?
+4. Как изменились показатели альбумина и калия?
+
+В первом ответе должны учитываться пять подтверждённых строк. Креатинин
+`0.91 → 1.04 mg/dL`, разница `+0.13 mg/dL` и `+14.29%`. Альбумин
+`4.2 → 4.2 g/dL`, изменение `0%`. Калий `4.3 mmol/L` представлен одной
+точкой, поэтому динамику определить нельзя. Проверьте полноту, источники,
+точность чисел и медицинских выводов, работу уточнений и выбор инструментов.
+Сгруппируйте журнал по `generation`. `chat_agent_round` показывает раунды,
+`ollama_request` и `gigachat_request` показывают HTTP-запросы к модели,
+`chat_agent_tool` показывает операции, `chat_generation_complete` даёт
+длительность. Отметьте ответы, прошедшие только через резервный путь.
+
+```bash
+dc logs --since=15m backend | grep -E 'chat_(agent_round|agent_tool|agent_fallback|generation_complete)|ollama_(request|stream_done)|gigachat_(request|stream_done)'
+read -r -p 'Провайдер (ollama/gigachat): ' chat_provider
+read -r -p 'Успешные ответы из 4, медиана мс, всего запросов к модели: ' passed median calls
+dc exec -T -e COMPARE_PROVIDER="$chat_provider" -e COMPARE_PASSED="$passed" \
+  -e COMPARE_MEDIAN_MS="$median" -e COMPARE_CALLS="$calls" mlflow python - <<'PY'
+import os
+import mlflow
+
+provider = os.environ["COMPARE_PROVIDER"]
+assert provider in {"ollama", "gigachat"}
+passed = int(os.environ["COMPARE_PASSED"])
+assert 0 <= passed <= 4
+mlflow.set_tracking_uri("http://127.0.0.1:5000")
+mlflow.set_experiment("medical-ai-chat-provider-comparison")
+with mlflow.start_run(run_name=f"{provider} synthetic 04-multipage"):
+    mlflow.log_param("provider", provider)
+    mlflow.log_metrics({
+        "passed": passed,
+        "median_ms": float(os.environ["COMPARE_MEDIAN_MS"]),
+        "model_requests": int(os.environ["COMPARE_CALLS"]),
+    })
+PY
+```
+
+В MLflow записываются агрегаты сравнения. Тексты вопросов, диалогов, выдержки
+и ответы в эксперимент не передаются.
 [Правила проверки источников и фактов](HYBRID_RAG.md#как-чат-проверяет-источники-и-факты)
 
 ## Конфигурация
@@ -122,9 +373,9 @@ RAG остаётся включённым: уменьшается только �
 Backend принимает ровно два значения `LLM_OLLAMA_URL`:
 `http://ollama:11434` и `http://host.docker.internal:11434`.
 Другие схемы, порты, адреса, credentials, пути, query, fragment и завершающий `/`
-отклоняются Pydantic при чтении конфигурации. Frontend URL провайдера не передаёт;
-внешние провайдеры, redirects и proxy environment остаются отключены.
-Автоматического переключения между Docker и Windows Ollama нет.
+отклоняются Pydantic при чтении конфигурации. URL задаётся на backend, redirects
+и proxy environment выключены. Для перехода между Docker и Windows Ollama
+требуется явное изменение конфигурации.
 
 Для гибридного режима вручную задайте в рабочем `.env`:
 
@@ -303,10 +554,10 @@ disconnect требует ручной проверки. Изменений fron
 
 ## Итоговый текстовый чат
 
-Ollama обрабатывает обычные сообщения и анализ документов одним вызовом
-`Gateway.stream()`. Режим JSON остаётся доступен в Gateway для машинных
-результатов. Внешнее извлечение GigaChat продолжает требовать согласия на
-конкретный документ. В чат облачный провайдер подключён не был.
+Обычные сообщения и анализ документов проходят через общий Agent Loop и
+выбранный в настройках Gateway. Режим JSON остаётся доступен для машинных
+результатов. Внешнее извлечение продолжает требовать отдельного согласия
+на конкретный документ.
 
 Python вычисляет сравнения, динамику и отклонения, проверяет принадлежность
 документов и передаёт модели исходный вопрос, проверенные строки, расчёты, полные
@@ -375,7 +626,7 @@ ct run --no-deps --pull never --rm \
   -v "$backend_src/alembic.ini:/app/alembic.ini:ro" \
   -v "$backend_src/evaluation:/app/evaluation:ro" \
   tests python -m pytest -q --durations=8 tests/test_chat_evidence.py \
-    tests/test_llm_gateway.py tests/test_chat_integration.py
+    tests/test_llm_gateway.py tests/test_gigachat_gateway.py tests/test_chat_integration.py
 
 dc exec -T frontend npm test -- tests/chat-api.test.ts tests/chat-ui.test.tsx
 dc exec -T frontend npm run typecheck

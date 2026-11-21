@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     rag_enabled: bool = False
     rag_retrieval_mode: Literal["dense", "hybrid"] = "dense"
     chat_enabled: bool = False
-    llm_provider: Literal["ollama"] = "ollama"
+    llm_provider: Literal["ollama", "gigachat"] = "ollama"
     llm_model: str = "qwen2.5:7b-instruct"
     llm_ollama_url: Literal["http://ollama:11434", "http://host.docker.internal:11434"] = (
         "http://ollama:11434"
@@ -62,6 +62,11 @@ class Settings(BaseSettings):
     llm_timeout_seconds: int = Field(default=180, ge=5, le=600)
     llm_context_tokens: int = Field(default=4096, ge=2048, le=32768)
     llm_max_tokens: int = Field(default=1024, ge=32, le=4096)
+    llm_gigachat_timeout_seconds: int = Field(default=180, ge=5, le=600)
+    llm_gigachat_context_tokens: int = Field(default=16384, ge=2048, le=128000)
+    llm_gigachat_max_tokens: int = Field(default=2048, ge=32, le=16000)
+    chat_gigachat_history_chars: int = Field(default=4000, ge=1000, le=64000)
+    chat_gigachat_context_chars: int = Field(default=6500, ge=1000, le=64000)
     chat_history_chars: int = Field(default=2000, ge=1000, le=64000)
     chat_context_chars: int = Field(default=2000, ge=1000, le=32000)
     rag_chunk_chars: int = Field(default=1200, ge=100, le=8000)
@@ -81,6 +86,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_rag(self) -> "Settings":
+        if self.llm_gigachat_max_tokens + 1024 >= self.llm_gigachat_context_tokens:
+            raise ValueError("GigaChat context must leave space for prompts and tool results")
         if self.rag_chunk_overlap >= self.rag_chunk_chars:
             raise ValueError("RAG chunk overlap must be smaller than chunk size")
         if self.rag_embedding_digest and not re.fullmatch(
@@ -89,6 +96,44 @@ class Settings(BaseSettings):
         ):
             raise ValueError("RAG embedding digest must be a full SHA-256 digest")
         return self
+
+    @property
+    def generation_timeout(self) -> int:
+        return (
+            self.llm_gigachat_timeout_seconds if self.llm_provider == "gigachat"
+            else self.llm_timeout_seconds
+        )
+
+    @property
+    def generation_context(self) -> int:
+        return (
+            self.llm_gigachat_context_tokens if self.llm_provider == "gigachat"
+            else self.llm_context_tokens
+        )
+
+    @property
+    def generation_output(self) -> int:
+        return (
+            self.llm_gigachat_max_tokens if self.llm_provider == "gigachat" else self.llm_max_tokens
+        )
+
+    @property
+    def generation_model(self) -> str:
+        return self.gigachat_model if self.llm_provider == "gigachat" else self.llm_model
+
+    @property
+    def generation_history_chars(self) -> int:
+        return (
+            self.chat_gigachat_history_chars if self.llm_provider == "gigachat"
+            else self.chat_history_chars
+        )
+
+    @property
+    def generation_tool_chars(self) -> int:
+        return (
+            self.chat_gigachat_context_chars if self.llm_provider == "gigachat"
+            else self.chat_context_chars
+        )
 
     def redis_url(self, database: int) -> str:
         password = quote(self.redis_password.get_secret_value(), safe="")

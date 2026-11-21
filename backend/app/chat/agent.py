@@ -25,16 +25,20 @@ from app.chat.evidence import EvidenceHit
 from app.chat.structured_context import structured_context
 from app.core.config import Settings
 from app.documents.models import Document
-from app.llm.gateway import Gateway, GatewayError, ToolCall
+from app.llm.gateway import Gateway, GatewayError, ToolCall, generation_log_id
 from app.rag.adapters import OllamaEmbeddings, QdrantVectors, RagError
 from app.rag.service import search
 
 MAX_ROUNDS = 5
 MAX_CALLS = 6
 logger = logging.getLogger("uvicorn.error").getChild("chat")
-DocumentNumber = Annotated[int, Field(ge=1, le=2**63 - 1)]
+DocumentNumber = Annotated[int, Field(
+    ge=1, le=2**63 - 1, description="The document number shown to the user.",
+)]
 DocumentNumbers = Annotated[list[DocumentNumber], Field(max_length=5)]
-Indicator = Annotated[str, Field(min_length=1, max_length=100)]
+Indicator = Annotated[str, Field(
+    min_length=1, max_length=100, description="A measurement name in Russian or English.",
+)]
 
 
 class ToolArguments(BaseModel):
@@ -53,12 +57,24 @@ class ListDocuments(ToolArguments):
 
 
 class SearchDocuments(ToolArguments):
-    query: Annotated[str, Field(min_length=1, max_length=400)]
-    documents: DocumentNumbers = Field(default_factory=list, description="Document numbers.")
+    query: Annotated[str, Field(
+        min_length=1, max_length=400,
+        description="Search text describing the facts or passages to find in the documents.",
+    )]
+    documents: DocumentNumbers = Field(
+        default_factory=list,
+        description="Document numbers to search. Omit to search all accessible documents.",
+    )
 
 
 class AnalyzeMeasurements(ToolArguments):
-    operation: Literal["results", "trend", "comparison", "deviations"]
+    operation: Literal["results", "trend", "comparison", "deviations"] = Field(
+        description=(
+            "Measurement analysis: results lists confirmed measurements; trend calculates dated "
+            "absolute and percentage changes; comparison compares measurements from two documents; "
+            "deviations reports values outside comparable reference ranges."
+        ),
+    )
     documents: Annotated[DocumentNumbers, Field(min_length=1, description="Document numbers.")]
     indicators: list[Indicator] = Field(
         default_factory=list, max_length=8, description="Analyte names in Russian or English.",
@@ -102,22 +118,30 @@ class ToolResult:
 
 def document_contents(extractions: list[Extraction], budget: int) -> ToolResult:
     with_text = [item for item in extractions if item.version.normalized_text.strip()]
-    prepared = structured_context(
-        extractions, "results", "", budget // (3 if with_text else 2), confirmed_only=True,
-    )
-    measurements = prepared.hits if prepared else []
     data: dict[str, Any] = {
         "documents": [
             {"number": item.document.document_number, "name": item.document.original_filename}
             for item in extractions
         ],
-        "result": prepared.answer if measurements and prepared else None,
-        "partial": bool(prepared and prepared.partial),
     }
-    measurement_pages = {hit["source_url"] for hit in measurements}
-    available = max(0, budget - len(encode(data).encode()) - 64 - 72 * len(measurement_pages))
+    table_budget = budget
+    text_reserve = min(240, budget // 5) if with_text else 0
+    while True:
+        prepared = structured_context(
+            extractions, "results", "", table_budget, confirmed_only=True,
+        )
+        measurements = prepared.hits if prepared else []
+        data["result"] = prepared.answer if measurements and prepared else None
+        data["partial"] = bool(prepared and prepared.partial)
+        measurement_pages = {hit["source_url"] for hit in measurements}
+        available = budget - len(encode(data).encode()) - 64 - 72 * len(measurement_pages)
+        if not measurements or available >= text_reserve:
+            break
+        # Shrink only after measuring the serialized result. Keep room for an excerpt.
+        used = sum(len(hit["text"]) for hit in measurements)
+        table_budget = max(0, used - max(1, (text_reserve - available) // 2))
     text_hits: list[EvidenceHit] = []
-    if with_text and available:
+    if with_text and available > 0:
         if sum(len(item.version.normalized_text) for item in with_text) <= available:
             for item in with_text:
                 pages = list(extracted_pages(item))
@@ -323,9 +347,9 @@ async def run_agent(
 
     def available_for_result(context: list[ToolRound]) -> int:
         remaining = room - len(encode(tool_messages(context)).encode()) - 96
-        return min(settings.chat_context_chars, remaining)
+        return min(settings.generation_tool_chars, remaining)
 
-    for _ in range(MAX_ROUNDS):
+    for round_number in range(1, MAX_ROUNDS + 1):
         transcript = tool_messages(rounds)
         used = len(encode(transcript).encode())
         while history and used + len(encode(history).encode()) > room:
@@ -335,14 +359,22 @@ async def run_agent(
         parts: list[str] = []
         calls: list[ToolCall] = []
         prompt = [messages[0], *history, messages[-1], *transcript]
-        async with aclosing(model.tool_stream(prompt, tools)) as events:
-            async for event in events:
-                if isinstance(event, str):
-                    parts.append(event)
-                else:
-                    calls.append(event)
-                    if len(calls) > calls_left:
-                        raise GatewayError("agent_tool_limit")
+        logger.info(
+            "chat_agent_round generation=%s provider=%s model=%s round=%d",
+            generation, settings.llm_provider, settings.generation_model, round_number,
+        )
+        log_context = generation_log_id.set(str(generation))
+        try:
+            async with aclosing(model.tool_stream(prompt, tools)) as events:
+                async for event in events:
+                    if isinstance(event, str):
+                        parts.append(event)
+                    else:
+                        calls.append(event)
+                        if len(calls) > calls_left:
+                            raise GatewayError("agent_tool_limit")
+        finally:
+            generation_log_id.reset(log_context)
         if not calls:
             if not "".join(parts).strip():
                 raise GatewayError("agent_no_answer")
@@ -357,7 +389,7 @@ async def run_agent(
             "tool_calls": [call.message() for call in calls],
         }])
         for call in calls:
-            key = json.dumps(call.message(), sort_keys=True)
+            key = json.dumps([call.name, call.arguments], sort_keys=True)
             if key in seen:
                 raise GatewayError("agent_repeated_tool")
             seen.add(key)

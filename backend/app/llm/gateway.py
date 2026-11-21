@@ -1,9 +1,10 @@
-"""Local-only provider boundary. Never log prompts, responses or upstream errors."""
+"""Provider boundary. Never log prompts, responses or upstream errors."""
 
 import asyncio
 import json
 import logging
 from collections.abc import AsyncGenerator, AsyncIterator
+from contextvars import ContextVar
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Any, Protocol, TypeVar
@@ -15,6 +16,7 @@ from app.core.config import Settings
 
 T = TypeVar("T", bound=BaseModel)
 logger = logging.getLogger("uvicorn.error").getChild("ollama")
+generation_log_id: ContextVar[str] = ContextVar("llm_generation_id", default="-")
 
 
 async def response_lines(response: httpx.Response) -> AsyncIterator[bytes]:
@@ -46,9 +48,13 @@ class _StructuredOutputLimit(Exception):
 class ToolCall:
     name: str
     arguments: dict[str, Any]
+    state_id: str | None = None
 
     def message(self) -> dict[str, Any]:
-        return {"function": {"name": self.name, "arguments": self.arguments}}
+        message: dict[str, Any] = {"function": {"name": self.name, "arguments": self.arguments}}
+        if self.state_id is not None:
+            message["state_id"] = self.state_id
+        return message
 
 
 class Provider(Protocol):
@@ -102,7 +108,9 @@ class Ollama:
         size = 0
         started = perf_counter()
         logger.info(
-            "ollama_request num_ctx=%d num_predict=%d messages=%d input_bytes=%d",
+            "ollama_request generation=%s provider=ollama model=%s "
+            "num_ctx=%d num_predict=%d messages=%d input_bytes=%d",
+            generation_log_id.get(), self.settings.llm_model,
             self.settings.llm_context_tokens, self.settings.llm_max_tokens, len(messages),
             sum(len(message["content"].encode()) for message in messages),
         )
@@ -163,9 +171,10 @@ class Ollama:
                                     )
                                 )
                                 logger.info(
-                                    "ollama_stream_done reason=%s prompt_tokens=%s "
+                                    "ollama_stream_done generation=%s reason=%s prompt_tokens=%s "
                                     "output_tokens=%s duration_ms=%.0f",
-                                    safe_reason, prompt_tokens, output_tokens,
+                                    generation_log_id.get(), safe_reason, prompt_tokens,
+                                    output_tokens,
                                     (perf_counter() - started) * 1000,
                                 )
                                 if schema is not None and reason == "length":
@@ -220,9 +229,14 @@ class Gateway:
             raise GatewayError(code) from None
 
 
-def gateway(settings: Settings, provider: str | None = None) -> Gateway:
-    # Future OpenAI/DeepSeek/YandexGPT/GigaChat adapters must implement Provider.
-    # No registry, SDK, credentials, fallback or external network path exists today.
-    if (settings.llm_provider if provider is None else provider) != "ollama":
-        raise GatewayError("provider_disabled")
-    return Gateway(Ollama(settings))
+def gateway(
+    settings: Settings, provider: str | None = None, *, external_consent: bool = False,
+) -> Gateway:
+    selected = settings.llm_provider if provider is None else provider
+    if selected == "ollama":
+        return Gateway(Ollama(settings))
+    if selected == "gigachat" and settings.llm_provider == "gigachat" and external_consent:
+        from app.llm.gigachat import GigaChat
+
+        return Gateway(GigaChat(settings))
+    raise GatewayError("provider_disabled")

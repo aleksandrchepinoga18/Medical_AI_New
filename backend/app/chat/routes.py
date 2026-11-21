@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from anyio import to_thread
@@ -82,6 +82,7 @@ class Title(BaseModel):
 class Prompt(BaseModel):
     model_config = ConfigDict(extra="forbid")
     content: str = Field(min_length=1, max_length=2000)
+    external_consent: Literal["gigachat"] | None = None
 
 
 def owned(db: Session, user_id: UUID, conversation_id: UUID, lock: bool = False) -> Conversation:
@@ -136,8 +137,11 @@ def history(
     )
     sources = [source for message in messages for source in message.sources]
     allowed = verified_document_numbers(db, user.id, sources)
+    settings = get_settings()
     return {
         **summary(row),
+        "llm_provider": settings.llm_provider,
+        "llm_model": settings.generation_model,
         "messages": [
             {
                 "id": str(m.id),
@@ -286,7 +290,7 @@ def encoded(value: object) -> str:
 
 
 def input_room(question: str, settings: Settings) -> int:
-    return max(0, settings.llm_context_tokens - settings.llm_max_tokens
+    return max(0, settings.generation_context - settings.generation_output
                - len(SYSTEM.encode()) - len(encoded({"question": question}).encode()) - 128)
 
 
@@ -351,8 +355,8 @@ def model_messages(
     *, calculation: str | None = None,
 ) -> tuple[list[dict[str, str]], list[EvidenceHit], list[dict[str, Any]]]:
     room = input_room(question, settings)
-    reserve = min(room // 4, settings.chat_history_chars) if previous else 0
-    budget = min(room - reserve, settings.chat_context_chars)
+    reserve = min(room // 4, settings.generation_history_chars) if previous else 0
+    budget = min(room - reserve, settings.generation_tool_chars)
     fragments: list[dict[str, Any]] = []
     included: list[EvidenceHit] = []
     labels: dict[str, str] = {}
@@ -368,7 +372,7 @@ def model_messages(
         if cost > budget and "text" in fragment:
             cap = budget - len(encoded({**fragment, "text": ""}).encode()) - 1
             if len(document_ids) > 1:
-                cap = min(cap, settings.chat_context_chars // len(document_ids))
+                cap = min(cap, settings.generation_tool_chars // len(document_ids))
             text = hit["text"].encode()[:max(0, cap)]
             while text:
                 fragment["text"] = text.decode(errors="ignore").rstrip()
@@ -400,7 +404,7 @@ def model_messages(
             room -= cost
     history_sources: list[dict[str, Any]] = []
     turns: list[list[dict[str, str]]] = []
-    history_budget = min(max(0, room), settings.chat_history_chars)
+    history_budget = min(max(0, room), settings.generation_history_chars)
     for i in range(len(previous) - 1, 0, -1):
         user_message, reply = previous[i - 1], previous[i]
         if user_message.role != "user" or reply.role != "assistant":
@@ -661,7 +665,7 @@ def agent_context(
                 )
                 break
     request = encoded(context)
-    room = settings.llm_context_tokens - settings.llm_max_tokens - (
+    room = settings.generation_context - settings.generation_output - (
         len(AGENT_SYSTEM.encode()) + len(request.encode()) + 128
     )
     prompt: list[dict[str, Any]] = [
@@ -677,13 +681,20 @@ def send(conversation_id: UUID, data: Prompt, db: DB, user: AuthenticatedUser) -
     if not data.content.strip():
         raise HTTPException(422, "Empty message")
     row = owned(db, user.id, conversation_id, True)
+    cloud = settings.llm_provider == "gigachat"
+    if cloud and data.external_consent != "gigachat":
+        raise HTTPException(403, detail={"code": "external_consent_required"})
+    local_settings = settings.model_copy(update={"llm_provider": "ollama"}) if cloud else settings
     now = datetime.now(UTC)
     if row.lease_until and row.lease_until > now:
         raise HTTPException(409, "Generation in progress")
     token, user_id = uuid4(), user.id
     row.generation, row.lease_until = (
         token,
-        now + timedelta(seconds=settings.llm_timeout_seconds + settings.rag_http_timeout * 2 + 30),
+        now + timedelta(seconds=(
+            settings.generation_timeout + (local_settings.llm_timeout_seconds if cloud else 0)
+            + settings.rag_http_timeout * 2 + 30
+        )),
     )
     db.execute(
         update(Message)
@@ -696,7 +707,10 @@ def send(conversation_id: UUID, data: Prompt, db: DB, user: AuthenticatedUser) -
     message_id = message.id
     db.commit()
     started = perf_counter()
-    logger.info("chat_generation_pending generation=%s", token)
+    logger.info(
+        "chat_generation_pending generation=%s provider=%s model=%s",
+        token, settings.llm_provider, settings.generation_model,
+    )
 
     def load_agent_context() -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, tuple[int, ...]]:
         with Session(get_engine()) as session:
@@ -704,15 +718,16 @@ def send(conversation_id: UUID, data: Prompt, db: DB, user: AuthenticatedUser) -
 
     def load_legacy() -> LegacyTurn:
         with Session(get_engine()) as session:
-            return prepare_legacy(session, user_id, conversation_id, data.content, settings)
+            return prepare_legacy(session, user_id, conversation_id, data.content, local_settings)
 
     async def stream() -> AsyncIterator[str]:
         complete = False
         model_failed = False
         stage = "start"
         reason = "stream_closed"
+        fallback_notice = ""
         try:
-            deadline = asyncio.get_running_loop().time() + settings.llm_timeout_seconds
+            deadline = asyncio.get_running_loop().time() + settings.generation_timeout
             yield json.dumps({"type": "start", "message_id": str(message_id)}) + "\n"
             stage = "agent"
             evidence = AgentEvidence()
@@ -725,8 +740,12 @@ def send(conversation_id: UUID, data: Prompt, db: DB, user: AuthenticatedUser) -
                     prompt, history_sources, room, requested = await to_thread.run_sync(
                         load_agent_context, abandon_on_cancel=True,
                     )
+                    model = (
+                        agent_gateway(settings, external_consent=True)
+                        if cloud else agent_gateway(settings)
+                    )
                     parts = await run_agent(
-                        agent_gateway(settings), prompt, settings, get_engine(), user_id,
+                        model, prompt, settings, get_engine(), user_id,
                         evidence, room, requested=requested, generation=token,
                     )
                     if not evidence.used_tools and needs_documents(data.content):
@@ -743,8 +762,15 @@ def send(conversation_id: UUID, data: Prompt, db: DB, user: AuthenticatedUser) -
                     model_sources = catalog_sources
             except (GatewayError, TimeoutError) as error:
                 code = str(error) if isinstance(error, GatewayError) else "timeout"
-                logger.warning("chat_agent_fallback generation=%s code=%s", token, code)
+                if code == "gigachat_filtered":
+                    raise
+                logger.warning(
+                    "chat_agent_fallback generation=%s code=%s provider=%s fallback=local",
+                    token, code, settings.llm_provider,
+                )
                 stage = "fallback"
+                if cloud:
+                    fallback_notice = "Резервный ответ · локальная обработка"
                 parts = []
                 legacy = await to_thread.run_sync(load_legacy, abandon_on_cancel=True)
                 answer, sources = legacy.answer, legacy.sources
@@ -763,6 +789,10 @@ def send(conversation_id: UUID, data: Prompt, db: DB, user: AuthenticatedUser) -
                         raise GatewayError(code) from None
                     answer = "Доступные выдержки из документов\n\n" + "\n\n".join(excerpts)
                     sources = legacy.model_sources
+                elif cloud and answer is None and legacy.messages:
+                    messages = legacy.messages
+                    model_sources, history_sources = legacy.model_sources, legacy.history_sources
+                    deadline = asyncio.get_running_loop().time() + local_settings.llm_timeout_seconds
                 elif answer is None:
                     raise GatewayError(code) from None
             buffered = bool(sources or model_sources or history_sources)
@@ -776,7 +806,11 @@ def send(conversation_id: UUID, data: Prompt, db: DB, user: AuthenticatedUser) -
                 stage = "model"
                 try:
                     async with asyncio.timeout_at(deadline):
-                        async for part in gateway(settings).stream(messages):
+                        async for part in gateway(local_settings).stream(messages):
+                            if fallback_notice and not buffered and not parts:
+                                yield json.dumps({
+                                    "type": "delta", "text": fallback_notice + "\n\n",
+                                }) + "\n"
                             if not received_content and part.strip():
                                 received_content = True
                                 logger.info(
@@ -847,7 +881,7 @@ def send(conversation_id: UUID, data: Prompt, db: DB, user: AuthenticatedUser) -
                     fixed += "\n\nПояснение модели не удалось сформировать."
                 if fixed and prose:
                     prose = "Пояснение\n\n" + prose
-                content = "\n\n".join(filter(None, (fixed, prose)))
+                content = "\n\n".join(filter(None, (fallback_notice, fixed, prose)))
                 pending = session.get(Message, message_id)
                 if pending is None:
                     reason = "pending_missing"

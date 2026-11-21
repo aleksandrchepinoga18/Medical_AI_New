@@ -28,12 +28,32 @@ it("does not treat HTTP 200 without done as a completed response", async () => {
   await expect(readChatStream(response, event => events.push(event.type))).rejects.toThrow("output_limit");
   expect(events).toEqual(["start", "delta"]);
 });
-it("uses CSRF and passes cancellation signal", async () => {
+it.each([
+  { content: "synthetic" },
+  { content: "synthetic", external_consent: "gigachat" },
+])("sends %j with CSRF and passes cancellation signal", async (body) => {
   const fetcher = vi.fn().mockResolvedValueOnce(Response.json({ csrf_token: "synthetic" }))
     .mockResolvedValueOnce(new Response(""));
   vi.stubGlobal("fetch", fetcher);
   const abort = new AbortController();
-  await chatRequest("/synthetic/messages", "POST", { content: "synthetic" }, abort.signal);
+  await chatRequest("/synthetic/messages", "POST", body, abort.signal);
   expect(fetcher.mock.calls[1][1].headers["X-CSRF-Token"]).toBe("synthetic");
+  expect(JSON.parse(fetcher.mock.calls[1][1].body)).toEqual(body);
   expect(fetcher.mock.calls[1][1].signal).toBe(abort.signal);
+});
+
+it.each([
+  {
+    detail: { code: "external_consent_required" },
+    explanation: "Подтвердите согласие на облачную обработку в GigaChat.",
+  },
+  { detail: "CSRF verification failed", explanation: "Проверка безопасности не пройдена." },
+  { detail: "unexpected detail", explanation: "Доступ к чату запрещён." },
+])("explains a forbidden chat request for $detail", async ({ detail, explanation }) => {
+  const fetcher = vi.fn()
+    .mockResolvedValueOnce(Response.json({ csrf_token: "synthetic" }))
+    .mockResolvedValueOnce(Response.json({ detail }, { status: 403 }));
+  vi.stubGlobal("fetch", fetcher);
+  await expect(chatRequest("/synthetic/messages", "POST", { content: "synthetic" }))
+    .rejects.toMatchObject({ status: 403, message: expect.stringContaining(explanation) });
 });

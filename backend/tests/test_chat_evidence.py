@@ -5,6 +5,7 @@ from uuid import uuid4
 import pymupdf
 import pytest
 
+from app.chat.agent import AgentEvidence, document_contents
 from app.chat.document_context import (
     Extraction,
     excerpt_payload,
@@ -32,6 +33,37 @@ from app.documents.extraction_data import ExtractionResult
 from app.documents.models import Document, DocumentTextVersion
 from app.documents.providers import local_report
 from evaluation.extraction_fixtures import load_fixtures, render
+
+
+def test_document_tool_packs_all_five_confirmed_measurements_when_they_fit():
+    fixture = next(item for item in load_fixtures() if item.id == "04-multipage")
+    text = "Синтетическая таблица."
+    rows = []
+    for page, spec in enumerate(fixture.pages, 1):
+        for index, (name, value, unit, reference, when) in enumerate(spec.rows, 1):
+            rows.append({
+                "name": name, "value": value, "unit": unit, "reference": reference, "date": when,
+                "confirmation": "confirmed",
+                "source": {"page": page, "bbox": [10, index * 20, 100, index * 20 + 10]},
+            })
+    doc = Document(id=uuid4(), original_filename="04-multipage.pdf", document_number=6)
+    version = DocumentTextVersion(
+        id=uuid4(), normalized_text=f"{text}\n{text}",
+        locators=[
+            {"kind": "page", "index": 1, "start": 0, "end": len(text)},
+            {"kind": "page", "index": 2, "start": len(text) + 1, "end": 2 * len(text) + 1},
+        ],
+        structured_result={"schema_version": 1, "local": {
+            "provider": "pymupdf_tables", "provider_version": "synthetic", "measurements": rows,
+        }},
+    )
+    result = document_contents([Extraction(doc, version)], 1100)
+    assert sum("measurement" in hit for hit in result.hits) == 5
+    rendered = AgentEvidence().render(result, 1100)
+    assert len(rendered.encode()) <= 1100
+    payload = json.loads(rendered)
+    assert "error" not in payload
+    assert {source["page"] for source in payload["sources"]} == {1, 2}
 
 
 def hit(text, *, page=1, filename="synthetic.pdf"):

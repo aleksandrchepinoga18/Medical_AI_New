@@ -1,0 +1,20 @@
+# Optional credentials and CA for the backend chat. Compose defaults to Ollama.
+services:
+  backend:
+    environment:
+      GIGACHAT_CREDENTIALS: ${GIGACHAT_CREDENTIALS:-}
+      GIGACHAT_SCOPE: ${GIGACHAT_SCOPE:-GIGACHAT_API_PERS}
+      GIGACHAT_MODEL: ${GIGACHAT_MODEL:-GigaChat-3-Ultra}
+      GIGACHAT_CA_BUNDLE: ${GIGACHAT_CA_BUNDLE:-}
+      LLM_GIGACHAT_TIMEOUT_SECONDS: ${LLM_GIGACHAT_TIMEOUT_SECONDS:-180}
+      LLM_GIGACHAT_CONTEXT_TOKENS: ${LLM_GIGACHAT_CONTEXT_TOKENS:-16384}
+      LLM_GIGACHAT_MAX_TOKENS: ${LLM_GIGACHAT_MAX_TOKENS:-2048}
+      CHAT_GIGACHAT_HISTORY_CHARS: ${CHAT_GIGACHAT_HISTORY_CHARS:-4000}
+      CHAT_GIGACHAT_CONTEXT_CHARS: ${CHAT_GIGACHAT_CONTEXT_CHARS:-6500}
+    volumes:
+      - type: bind
+        source: ${GIGACHAT_CA_DIR:-./certs/gigachat}
+        target: /run/gigachat-ca
+        read_only: true
+        bind:
+          create_host_path: false

@@ -286,6 +286,72 @@ def publish_synthetic_report(owner, body, name, *, locators=None, structured=Non
     }
 
 
+@pytest.mark.parametrize("failure_status", [422, 503])
+def test_gigachat_requires_consent_per_message_and_cloud_failure_falls_back_locally(
+    setup, monkeypatch, failure_status,
+):
+    client, _ = setup
+    cid = client.post("/chat").json()["id"]
+    other = client.post("/chat").json()["id"]
+    local = client.get(f"/chat/{cid}").json()
+    assert local["llm_provider"] == "ollama" and local["llm_model"] == get_settings().llm_model
+    assert send_events(client, cid, "Реплика для текущего диалога")[-1]["type"] == "done"
+    assert send_events(client, other, "Реплика для другого диалога")[-1]["type"] == "done"
+    settings = get_settings().model_copy(update={"llm_provider": "gigachat"})
+    monkeypatch.setattr(routes, "get_settings", lambda: settings)
+    cloud_calls = []
+    local_calls = []
+
+    class Cloud:
+        async def tool_stream(self, messages, tools):
+            cloud_calls.append(messages)
+            if len(cloud_calls) > 1:
+                raise GatewayError(f"gigachat_http_{failure_status}")
+            yield "Синтетический ответ"
+
+    class Local:
+        async def stream(self, messages):
+            local_calls.append(messages)
+            yield "Локальный ответ"
+
+    def cloud_factory(config, *, external_consent):
+        assert config.llm_provider == "gigachat" and external_consent is True
+        return Cloud()
+
+    def local_factory(config):
+        assert config.llm_provider == "ollama"
+        return Local()
+
+    monkeypatch.setattr(routes, "agent_gateway", cloud_factory)
+    monkeypatch.setattr(routes, "gateway", local_factory)
+    path = f"/chat/{cid}/messages"
+    denied = client.post(path, json={"content": "Без согласия"})
+    assert denied.status_code == 403
+    assert denied.json()["detail"] == {"code": "external_consent_required"}
+    assert client.post(path, json={"content": "PDF", "consent": True}).status_code == 422
+    history = client.get(f"/chat/{cid}").json()
+    assert history["llm_provider"] == "gigachat" and history["llm_model"] == "GigaChat-3-Ultra"
+    assert len(history["messages"]) == 2
+    assert not cloud_calls and not local_calls
+
+    allowed = {"content": "Синтетический вопрос", "external_consent": "gigachat"}
+    response = client.post(path, json=allowed)
+    events = [json.loads(line) for line in response.text.splitlines()]
+    assert response.status_code == 200 and events[-1]["type"] == "done"
+    assert "Реплика для текущего диалога" in [message["content"] for message in cloud_calls[0]]
+    assert "Реплика для другого диалога" not in [message["content"] for message in cloud_calls[0]]
+    assert client.post(path, json={"content": "Снова без согласия"}).status_code == 403
+    assert len(cloud_calls) == 1 and not local_calls
+
+    response = client.post(path, json=allowed)
+    events = [json.loads(line) for line in response.text.splitlines()]
+    assert response.status_code == 200 and events[-1]["type"] == "done"
+    assert len(cloud_calls) == 2 and len(local_calls) == 1
+    answer = "".join(event["text"] for event in events if event["type"] == "delta")
+    assert answer == "Резервный ответ · локальная обработка\n\nЛокальный ответ"
+    assert client.get(f"/chat/{cid}").json()["messages"][-1]["content"] == answer
+
+
 def test_native_agent_dialogue_sources_and_fallback(setup, monkeypatch, caplog):
     client, users = setup
     owner, foreign = (user.id for user in users)
