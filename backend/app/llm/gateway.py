@@ -3,7 +3,8 @@
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
+from dataclasses import dataclass
 from time import perf_counter
 from typing import Any, Protocol, TypeVar
 
@@ -41,10 +42,23 @@ class _StructuredOutputLimit(Exception):
     """The provider reached num_predict after yielding its last structured chunk."""
 
 
+@dataclass(frozen=True)
+class ToolCall:
+    name: str
+    arguments: dict[str, Any]
+
+    def message(self) -> dict[str, Any]:
+        return {"function": {"name": self.name, "arguments": self.arguments}}
+
+
 class Provider(Protocol):
     def stream(
         self, messages: list[dict[str, str]], schema: dict[str, Any] | None = None
     ) -> AsyncIterator[str]: ...
+
+    def tool_stream(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+    ) -> AsyncGenerator[str | ToolCall, None]: ...
 
 
 class Ollama:
@@ -56,6 +70,20 @@ class Ollama:
     async def stream(
         self, messages: list[dict[str, str]], schema: dict[str, Any] | None = None
     ) -> AsyncIterator[str]:
+        async for event in self._events(messages, schema=schema):
+            if not isinstance(event, str):
+                raise GatewayError("unexpected_tool_call")
+            yield event
+
+    def tool_stream(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+    ) -> AsyncGenerator[str | ToolCall, None]:
+        return self._events(messages, tools=tools)
+
+    async def _events(
+        self, messages: list[dict[str, Any]], *, schema: dict[str, Any] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncGenerator[str | ToolCall, None]:
         # Settings permits only Docker Ollama or explicitly selected host Ollama.
         payload: dict[str, Any] = {
             "model": self.settings.llm_model,
@@ -69,6 +97,8 @@ class Ollama:
         }
         if schema is not None:
             payload["format"] = schema
+        if tools is not None:
+            payload["tools"] = tools
         size = 0
         started = perf_counter()
         logger.info(
@@ -94,6 +124,8 @@ class Ollama:
                             response.status_code, (perf_counter() - started) * 1000,
                         )
                         if response.status_code != 200:
+                            if tools and response.status_code == 400:
+                                raise GatewayError("tools_unsupported")
                             raise GatewayError("unavailable")
                         async for line in response_lines(response):
                             item = json.loads(line)
@@ -110,6 +142,17 @@ class Ollama:
                                 raise GatewayError("output_limit")
                             if content:
                                 yield content
+                            calls = message.get("tool_calls", [])
+                            if not isinstance(calls, list):
+                                raise GatewayError("invalid_response")
+                            for call in calls:
+                                function = call.get("function") if isinstance(call, dict) else None
+                                if not isinstance(function, dict):
+                                    raise GatewayError("invalid_response")
+                                name, args = function.get("name"), function.get("arguments")
+                                if not isinstance(name, str) or not isinstance(args, dict):
+                                    raise GatewayError("invalid_response")
+                                yield ToolCall(name, args)
                             if item.get("done") is True:
                                 reason = item.get("done_reason")
                                 safe_reason = reason if reason in ("stop", "length") else "other"
@@ -150,6 +193,11 @@ class Gateway:
 
     def stream(self, messages: list[dict[str, str]]) -> AsyncIterator[str]:
         return self.provider.stream(messages)
+
+    def tool_stream(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+    ) -> AsyncGenerator[str | ToolCall, None]:
+        return self.provider.tool_stream(messages, tools)
 
     async def generate(self, messages: list[dict[str, str]]) -> str:
         return "".join([part async for part in self.stream(messages)])

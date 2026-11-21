@@ -209,7 +209,7 @@ def comparison(
 ) -> list[str]:
     grouped: dict[str, dict[int, list[Record]]] = defaultdict(lambda: defaultdict(list))
     for record in all_records:
-        grouped[comparable_name(record.row.name)][record.document_number].append(record)
+        grouped[analyte(record.row.name)][record.document_number].append(record)
     visible_ids = {id(record) for record in visible}
     lines = []
     for by_doc in grouped.values():
@@ -263,6 +263,7 @@ def trend(records: list[Record], *, partial: bool) -> list[str]:
 def structured_context(
     extractions: list[Extraction], mode: Mode, question: str, budget: int,
     *, targets: set[str] | None = None, earlier_questions: Sequence[str] = (),
+    indicators: Sequence[str] = (), confirmed_only: bool = False,
 ) -> OverviewContext | None:
     if not any(item.version.structured_result is not None for item in extractions):
         return None
@@ -277,8 +278,10 @@ def structured_context(
             stored = None
         decoded.append((item, stored))
     time_series = mode in ("trend", "change")
-    labels: dict[str, str] = {}
-    if time_series:
+    labels = {analyte(name): name for name in indicators}
+    if labels:
+        targets = set(labels)
+    elif time_series:
         names = dict.fromkeys(
             row.name for _, stored in decoded if stored is not None
             for report in (stored.local, stored.external) if report is not None
@@ -306,7 +309,7 @@ def structured_context(
         data = item.version.structured_result
         number = item.document.document_number
         if data is None:
-            if mode in ("comparison", "results", "deviations"):
+            if not confirmed_only and mode in ("comparison", "results", "deviations"):
                 legacy = overview_context([item], "results", min(share, budget), 0)
                 if legacy.answer and legacy.hits:
                     groups.append(legacy.answer)

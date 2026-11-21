@@ -16,11 +16,11 @@ from sqlalchemy.orm import Session
 from alembic import command
 from app.auth.models import User
 from app.auth.routes import current_user
-from app.chat import routes
+from app.chat import agent, routes
 from app.chat.models import Conversation, Message
 from app.db import database_url, get_db, get_settings
 from app.documents.models import Document, DocumentTextVersion
-from app.llm.gateway import Gateway, GatewayError, Ollama
+from app.llm.gateway import Gateway, GatewayError, Ollama, ToolCall
 from app.main import app
 from app.rag.adapters import OllamaEmbeddings, QdrantVectors, RagError, fingerprint
 from app.rag.hybrid import QdrantHybrid
@@ -71,6 +71,13 @@ def setup(monkeypatch):
             yield "answer"
 
     monkeypatch.setattr(routes, "gateway", lambda settings: Fake())
+
+    # The existing regressions exercise the preserved fallback. Agent tests enable
+    # native tool calling through the real gateway with a mock Ollama transport.
+    def legacy_only(_settings):
+        raise GatewayError("tools_unsupported")
+
+    monkeypatch.setattr(routes, "agent_gateway", legacy_only)
     try:
         with TestClient(app) as client:
             yield client, users
@@ -277,6 +284,261 @@ def publish_synthetic_report(owner, body, name, *, locators=None, structured=Non
             "generation": str(generation),
         },
     }
+
+
+def test_native_agent_dialogue_sources_and_fallback(setup, monkeypatch, caplog):
+    client, users = setup
+    owner, foreign = (user.id for user in users)
+    caplog.set_level("INFO", logger="uvicorn.error.chat")
+
+    def supply(user, name, records):
+        rows = [
+            {
+                "name": analyte, "value": value, "unit": unit, "reference": limits,
+                "date": date, "confirmation": "confirmed",
+                "source": {"page": 1, "bbox": [10, i * 20, 100, i * 20 + 10]},
+            }
+            for i, (analyte, value, unit, limits, date) in enumerate(records, 1)
+        ]
+        return publish_synthetic_report(user, "Синтетический отчёт.", name, structured={
+            "schema_version": 1,
+            "local": {
+                "provider": "pymupdf_tables", "provider_version": "synthetic", "measurements": rows,
+            },
+        })[1]["payload"]
+
+    first = supply(owner, "first.pdf", [
+        ("Creatinine", "0.91", "mg/dL", "0.60–1.20", "2026-10-02"),
+        ("Albumin", "4.2", "g/dL", "3.5–5.0", "2026-10-02"),
+    ])
+    second = supply(owner, "second.pdf", [
+        ("Creatinine", "1.04", "mg/dL", "0.60–1.20", "2026-10-16"),
+        ("Albumin", "4.2", "g/dL", "3.5–5.0", "2026-10-16"),
+        ("Potassium", "4.3", "mmol/L", "3.5–5.1", "2026-10-16"),
+    ])
+    supply(foreign, "private.pdf", [])
+    planned = "Как изменились показатели альбумина и калия в документах №1 и №2?"
+    clarification = "На сколько изменился креатинин?"
+    cases = iter((
+        ("text", "Здравствуйте!"),
+        ("get_documents", {}),
+        ("analyze_measurements", {"operation": "trend", "documents": ["1"]}),
+        ("analyze_measurements", {
+            "operation": "trend", "documents": [1, 2], "indicators": ["альбумина", "Potassium"],
+        }),
+        ("text", "Альбумин: +0.00% [S3] [S4]. Для калия недостаточно измерений [S4]."),
+        ("analyze_measurements", {
+            "operation": "comparison", "documents": [1, 2], "indicators": ["Creatinine"],
+        }),
+        ("text", "Разница +0.13 mg/dL [S1] [S2]."),
+        ("search_documents", {"query": "синтетический отчёт", "documents": [1]}),
+        ("text", "Найдена выдержка [S1]."),
+        ("analyze_measurements", {"operation": "results", "documents": [999]}),
+        ("text", "Документ недоступен."),
+        ("unavailable", None),
+    ))
+    payloads = []
+
+    def ollama(request):
+        payload = json.loads(request.content)
+        assert payload["stream"] is True and "format" not in payload
+        assert {tool["function"]["name"] for tool in payload["tools"]} == {
+            "get_documents", "search_documents", "analyze_measurements",
+        }
+        payloads.append(payload)
+        name, value = next(cases)
+        if name == "unavailable":
+            return httpx.Response(503)
+        message = {"content": value} if name == "text" else {
+            "content": "", "tool_calls": [{"function": {"name": name, "arguments": value}}],
+        }
+        return httpx.Response(200, content=(
+            json.dumps({"message": message}) + '\n{"done":true}\n'
+        ).encode())
+
+    def empty_rag(db, user_id, question, *args, only_document_ids, **kwargs):
+        assert user_id == owner and only_document_ids == {UUID(first["document_id"])}
+        assert question == "синтетический отчёт"
+        return []  # The existing current-extraction reader supplies the excerpt.
+
+    monkeypatch.setattr(agent, "search", empty_rag)
+    monkeypatch.setattr(routes, "agent_gateway", lambda settings: Gateway(Ollama(
+        settings, httpx.MockTransport(ollama),
+    )))
+    cid = client.post("/chat").json()["id"]
+    assert send_events(client, cid, "Поприветствуй меня")[-1] == {"type": "done", "sources": []}
+
+    events = send_events(client, cid, planned)
+    assert events[-1]["type"] == "done" and "+0.00%" in events[1]["text"]
+    assert "path=agent sources=2" in caplog.text and "chat_agent_fallback" not in caplog.text
+    expected = {first["document_id"], second["document_id"]}
+    assert {source["document_id"] for source in events[-1]["sources"]} == expected
+    assert {source["source_id"] for source in events[-1]["sources"]} == {"S3", "S4"}
+    assert "[S3]" in events[1]["text"] and "[S4]" in events[1]["text"]
+    catalog = json.loads(payloads[2]["messages"][-1]["content"])
+    assert [item["name"] for item in catalog["documents"]] == ["first.pdf", "second.pdf"]
+    assert json.loads(payloads[3]["messages"][-1]["content"]) == {"error": "invalid_arguments"}
+    tool_result = json.loads(payloads[4]["messages"][-1]["content"])
+    assert {source["id"] for source in tool_result["sources"]} == {"S3", "S4"}
+    assert "+0.00%" in tool_result["result"] and "Недостаточно измерений" in tool_result["result"]
+
+    events = send_events(client, cid, clarification)
+    assert events[-1]["type"] == "done" and "+0.13 mg/dL" in events[1]["text"]
+    follow_up = payloads[5]["messages"]
+    assert set(json.loads(follow_up[-1]["content"])["active_documents"]) == {1, 2}
+    assert {"role": "user", "content": planned} in follow_up[1:-1]
+    assert "+0.13" in json.loads(payloads[6]["messages"][-1]["content"])["result"]
+
+    events = send_events(client, cid, "Что в тексте документа №1?")
+    assert "Найдена выдержка" in events[1]["text"]
+    assert [source["document_id"] for source in events[-1]["sources"]] == [first["document_id"]]
+    assert "Синтетический отчёт" in payloads[8]["messages"][-1]["content"]
+
+    events = send_events(client, cid, "Объясни результаты документа №999")
+    assert events[-1] == {"type": "done", "sources": []}
+    assert "недоступен" in events[1]["text"]
+    assert "не найден" in json.loads(payloads[10]["messages"][-1]["content"])["result"]
+
+    caplog.clear()
+    events = send_events(client, cid, "Покажи динамику креатинина")
+    assert events[-1]["type"] == "done" and "+14.29%" in events[1]["text"]
+    assert {source["document_id"] for source in events[-1]["sources"]} == expected
+    assert all("source_id" not in source for source in events[-1]["sources"])
+    assert "path=fixed sources=2" in caplog.text
+    history = client.get(f"/chat/{cid}").json()["messages"]
+    assert len(history) == 12 and all(message["status"] == "complete" for message in history)
+
+
+@pytest.mark.parametrize(
+    "flow", ["exact", "large", "cursor_retry", "cursor_stop", "catalogue_only"],
+)
+def test_native_agent_gets_document_contents_in_one_tool_call(
+    setup, monkeypatch, caplog, flow,
+):
+    client, users = setup
+    owner, foreign = users
+    with Session(routes.get_engine()) as db:
+        for user in users:
+            db.get(User, user.id).last_document_number = 5
+        db.commit()
+    record = {
+        "name": "Creatinine", "value": "80", "unit": "мкмоль/л", "reference": None, "date": None,
+        "confirmation": "confirmed", "source": {"page": 1, "bbox": [10, 20, 100, 30]},
+    }
+    body = "Заключение: Синтетический отчёт."
+    detail = "Синтетическая деталь из конца документа."
+    locators = None
+    expected_pages = [body]
+    if flow == "exact":
+        page_end = len(body)
+        locators = [
+            {"kind": "page", "index": 1, "start": 0, "end": page_end},
+            {"kind": "page", "index": 2, "start": page_end + 1, "end": page_end + 1 + len(detail)},
+        ]
+        expected_pages.append(detail)
+        body = "\n".join(expected_pages)
+    if flow == "large":
+        body += "\n" + "Дополнительный синтетический текст.\n" * 120 + detail
+    _, document = publish_synthetic_report(
+        owner.id, body, "owned-six.pdf", locators=locators, structured={
+            "schema_version": 1,
+            "local": {
+                "provider": "pymupdf_tables", "provider_version": "synthetic",
+                "measurements": [record],
+            },
+        },
+    )
+    publish_synthetic_report(foreign.id, "Чужой отчёт.", "private-six.pdf")
+    caplog.set_level("INFO", logger="uvicorn.error.chat")
+    requests = []
+    cursor = flow.startswith("cursor")
+    if cursor:
+        args = {"after": 6}
+    elif flow == "catalogue_only":
+        args = {}
+    else:
+        args = {"documents": [6]}
+
+    def ollama(request):
+        messages = json.loads(request.content)["messages"]
+        requests.append(messages)
+        step = len(requests)
+        call = None
+        text = ""
+        if step == 1:
+            assert json.loads(messages[-1]["content"])["requested_documents"] == [6]
+            call = ToolCall("get_documents", args)
+        elif step == 2 and cursor:
+            assert messages[-1]["role"] == "tool" and messages[-1]["tool_name"] == "get_documents"
+            assert json.loads(messages[-1]["content"]) == {
+                "error": "catalogue_page_empty", "retry_arguments": {"documents": [6]},
+            }
+            if flow == "cursor_retry":
+                call = ToolCall("get_documents", {"documents": [6]})
+            else:
+                text = "Документ недоступен."
+        elif flow == "catalogue_only":
+            result = json.loads(messages[-1]["content"])
+            assert result["documents"] == [{"number": 6, "name": "owned-six.pdf", "id": "S1"}]
+            assert result["sources"] == []
+            text = "Документ недоступен."
+        elif flow == "large" and step == 3:
+            result = json.loads(messages[-1]["content"])
+            assert [item["text"] for item in result["sources"]] == [detail]
+            text = "В отчёте креатинин 80 мкмоль/л. Найдена деталь [S1]."
+        else:
+            result = json.loads(messages[-1]["content"])
+            assert result["documents"] == [{"number": 6, "name": "owned-six.pdf"}]
+            assert "Creatinine: 80" in result["result"]
+            if flow == "large":
+                assert result["partial"] is True
+                call = ToolCall("search_documents", {"query": detail, "documents": [6]})
+            else:
+                passages = [item["text"] for item in result["sources"] if "text" in item]
+                assert passages == expected_pages
+                assert result["partial"] is False
+                text = "В отчёте креатинин 80 мкмоль/л [S1]."
+        message = (
+            {"content": text, "tool_calls": [call.message()]} if call else {"content": text}
+        )
+        return httpx.Response(200, content=(
+            json.dumps({"message": message}) + '\n{"done":true}\n'
+        ).encode())
+
+    def scoped_search(db, user_id, query, *args, only_document_ids, **kwargs):
+        assert flow == "large" and query == detail
+        assert user_id == owner.id
+        assert only_document_ids == {UUID(document["payload"]["document_id"])}
+        extractions, notice = agent.resolve_documents(db, user_id, (6,))
+        assert notice is None
+        return [{**next(agent.extracted_pages(extractions[0])), "text": detail}]
+
+    monkeypatch.setattr(agent, "search", scoped_search)
+    monkeypatch.setattr(routes, "agent_gateway", lambda settings: Gateway(Ollama(
+        settings, httpx.MockTransport(ollama),
+    )))
+    cid = client.post("/chat").json()["id"]
+    events = send_events(client, cid, "Объясни результаты документа №6")
+    assert events[-1]["type"] == "done" and "80 мкмоль/л" in events[1]["text"]
+    assert "недоступен" not in events[1]["text"]
+    sources = events[-1]["sources"]
+    assert {source["document_number"] for source in sources} == {6}
+    assert {source["document_id"] for source in sources} == {document["payload"]["document_id"]}
+    assert {source["source_url"].rsplit("#", 1)[-1] for source in sources} == {
+        f"source-page-{i}" for i in range(1, len(expected_pages) + 1)
+    }
+    assert len(requests) == (3 if flow in ("large", "cursor_retry") else 2)
+    if cursor:
+        assert "tool=get_documents status=error code=catalogue_page_empty" in caplog.text
+    if flow in ("exact", "large", "cursor_retry"):
+        assert (
+            "tool=get_documents status=ok code=- documents=1 measurements=1 "
+            f"sources={len(expected_pages)}"
+        ) in caplog.text
+        assert "chat_agent_fallback" not in caplog.text
+    else:
+        assert "chat_agent_fallback" in caplog.text and "code=agent_data_unavailable" in caplog.text
+    assert all(text not in caplog.text for text in ("owned-six.pdf", "private-six.pdf", "Creatinine"))
 
 
 def test_structured_chat_uses_confirmed_measurements_and_owned_sources(setup, monkeypatch):
@@ -738,10 +1000,8 @@ def test_personal_narrative_streams_only_relevant_context_and_handles_outage(set
         raise RagError("HTTP_503")
 
     monkeypatch.setattr(QdrantVectors, "query", unavailable)
-    response = client.post(
-        f"/chat/{cid}/messages", json={"content": "Что в моей выписке match.pdf про ночной кашель?"}
-    )
-    assert response.status_code == 503
+    events = send_events(client, cid, "Что в моей выписке match.pdf про ночной кашель?")
+    assert events[-1] == {"type": "error", "code": "retrieval_unavailable"}
     messages = client.get(f"/chat/{cid}").json()["messages"]
     assert messages[-1]["status"] == "failed"
     assert messages[-2]["sources"][0]["filename"] == "match.pdf"
@@ -938,12 +1198,20 @@ def test_document_analysis_searches_selected_documents_and_accepts_text_with_num
     assert {source["source_id"] for source in events[-1]["sources"]} == {"S1", "S2"}
 
 
-def test_document_prose_is_not_published_after_source_version_changes(setup, monkeypatch):
+@pytest.mark.parametrize("native", [False, True])
+def test_document_prose_is_not_published_after_source_version_changes(setup, monkeypatch, native):
     client, users = setup
     _, doc = publish_synthetic_report(users[0].id, "Устаревающая выдержка.", "source.pdf")
     document_id = UUID(doc["payload"]["document_id"])
 
     class Provider:
+        async def tool_stream(self, messages, tools):
+            if messages[-1]["role"] == "user":
+                yield ToolCall("search_documents", {"query": "выдержка", "documents": [1]})
+                return
+            async for chunk in self.stream(messages):
+                yield chunk
+
         async def stream(self, messages):
             yield "Устаревающее пояснение."
             with Session(routes.get_engine()) as db:
@@ -953,7 +1221,11 @@ def test_document_prose_is_not_published_after_source_version_changes(setup, mon
                 ))
                 db.commit()
 
-    monkeypatch.setattr(routes, "gateway", lambda _: Provider())
+    if native:
+        monkeypatch.setattr(agent, "search", lambda *args, **kwargs: [])
+        monkeypatch.setattr(routes, "agent_gateway", lambda _: Provider())
+    else:
+        monkeypatch.setattr(routes, "gateway", lambda _: Provider())
     cid = client.post("/chat").json()["id"]
     events = send_events(client, cid, "Что сказано в документе №1?")
     assert [event["type"] for event in events] == ["start", "error"]
