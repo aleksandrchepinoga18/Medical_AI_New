@@ -13,19 +13,24 @@ services:
   frontend:
     image: ${COMPOSE_PROJECT_NAME:-medical-ai}-frontend:development
     build: {target: development}
-    command: [npm, run, dev]
+    command:
+      - sh
+      - -ec
+      - >-
+        cp /tmp/frontend-tsconfig.json /app/tsconfig.json &&
+        exec npm run dev -- --webpack
     environment:
       NODE_ENV: development
       HOSTNAME: 0.0.0.0
       PORT: "3000"
     volumes:
-      # Keep dependencies, the build cache, and generated next-env.d.ts inside the container.
-      - ../frontend/app:/app/app
+      # Next.js writes .next, next-env.d.ts, and TypeScript config updates inside the container.
+      - ../frontend/app:/app/app:ro
       - ../frontend/tests:/app/tests:ro
       - ../frontend/components:/app/components:ro
       - ../frontend/lib:/app/lib:ro
       - ../frontend/next.config.ts:/app/next.config.ts:ro
-      - ../frontend/tsconfig.json:/app/tsconfig.json
+      - ../frontend/tsconfig.json:/tmp/frontend-tsconfig.json:ro
       - ../frontend/eslint.config.mjs:/app/eslint.config.mjs:ro
 
 # Legacy volumes are retained but no longer mounted by frontend.

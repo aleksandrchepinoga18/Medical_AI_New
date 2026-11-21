@@ -26,6 +26,7 @@ from app.rag.adapters import OllamaEmbeddings, QdrantVectors, RagError, fingerpr
 from app.rag.hybrid import QdrantHybrid
 from app.rag.models import RagChunk, RagIndexJob
 from app.rag.service import search
+from evaluation.extraction_fixtures import load_fixtures
 
 pytestmark = pytest.mark.integration
 
@@ -306,7 +307,7 @@ def test_structured_chat_uses_confirmed_measurements_and_owned_sources(setup, mo
 
     first = store(owner, "4,8", "2026-01-01")
     second = store(owner, "5,8", "2026-02-01")
-    hidden = store(foreign, "66", "2026-03-01")
+    store(foreign, "66", "2026-03-01")
     settings = get_settings().model_copy(update={"llm_context_tokens": 2048, "llm_max_tokens": 256})
     monkeypatch.setattr(routes, "get_settings", lambda: settings)
     model_calls = []
@@ -349,9 +350,12 @@ def test_structured_chat_uses_confirmed_measurements_and_owned_sources(setup, mo
     answer, sources = ask("Покажи отклонения от референсных значений документа № 2")
     assert "5,8" in answer and "выше" in answer and len(sources) == 1
     answer, sources = ask("Покажи динамику калия")
+    assert "2026-01-01" in answer and "2026-02-01" in answer
     assert answer.index("2026-01-01") < answer.index("2026-02-01")
     assert "2026-03-01" not in answer
-    assert hidden["document_id"] not in [source["document_id"] for source in sources]
+    assert {source["document_id"] for source in sources} == {
+        first["document_id"], second["document_id"],
+    }
     answer, _ = ask("Покажи референсные значения документа №2")
     assert "Калий: 5,8 ммоль/л" in answer
     assert model_calls == []
@@ -381,6 +385,143 @@ def test_structured_chat_uses_confirmed_measurements_and_owned_sources(setup, mo
         db.commit()
     history = client.get(f"/chat/{cid}").json()["messages"]
     assert history[-1]["sources"] == []
+
+
+def test_document_follow_up_reuses_selection_and_current_measurements(setup, monkeypatch):
+    client, users = setup
+    owner = users[0].id
+
+    def measurements(first, second):
+        return {
+            "schema_version": 1,
+            "local": {
+                "provider": "pymupdf_tables", "provider_version": "synthetic",
+                "measurements": [
+                    {
+                        "name": "Креатинин", "value": value, "unit": "мкмоль/л",
+                        "date": when, "reference": None, "confirmation": "confirmed",
+                        "source": {"page": 1, "bbox": [10, y, 100, y + 10]},
+                    }
+                    for value, when, y in [(second, "2026-02-01", 20), (first, "2026-01-01", 40)]
+                ],
+            },
+        }
+
+    body = "Синтетический отчёт с двумя измерениями креатинина."
+    _, selected = publish_synthetic_report(
+        owner, body, "selected.pdf", structured=measurements("80", "100"),
+    )
+    _, other = publish_synthetic_report(
+        owner, body, "other.pdf", structured=measurements("50", "150"),
+    )
+    document_id = selected["payload"]["document_id"]
+    prompts = []
+
+    class Provider:
+        async def stream(self, messages):
+            prompts.append(messages)
+            yield "Синтетический ответ"
+
+    monkeypatch.setattr(routes, "gateway", lambda _: Provider())
+    cid = client.post("/chat").json()["id"]
+    events = send_events(client, cid, "Объясни результаты документа №1")
+    assert {source["document_id"] for source in events[-1]["sources"]} == {document_id}
+    payload = json.loads(prompts[-1][-1]["content"])
+    assert {source["confirmed_measurement"]["value"] for source in payload["sources"]
+            if "confirmed_measurement" in source} == {"80", "100"}
+
+    question = "Как изменился уровень креатинина между двумя измерениями?"
+    events = send_events(client, cid, question)
+    assert "+20 мкмоль/л" in events[1]["text"] and "+25.00%" in events[1]["text"]
+    assert {source["document_id"] for source in events[-1]["sources"]} == {document_id}
+    assert len(prompts) == 1  # The numerical answer came from Python.
+
+    percentage = "На сколько процентов он изменился?"
+    events = send_events(client, cid, percentage)
+    assert events[-1]["type"] == "done" and "+25.00%" in events[1]["text"]
+    assert {source["document_id"] for source in events[-1]["sources"]} == {document_id}
+    assert len(prompts) == 1
+
+    events = send_events(client, cid, "Что это означает?")
+    assert {source["document_id"] for source in events[-1]["sources"]} == {document_id}
+    payload = json.loads(prompts[-1][-1]["content"])
+    assert {source["confirmed_measurement"]["value"] for source in payload["sources"]
+            if "confirmed_measurement" in source} == {"80", "100"}
+    assert {"role": "user", "content": percentage} in prompts[-1][1:-1]
+    assert any(message["role"] == "assistant" and "+25.00%" in message["content"]
+               for message in prompts[-1][1:-1])
+
+    events = send_events(client, cid, percentage)
+    assert events[-1]["type"] == "done" and "+25.00%" in events[1]["text"]
+    assert {source["document_id"] for source in events[-1]["sources"]} == {document_id}
+    assert len(prompts) == 2
+    history = client.get(f"/chat/{cid}").json()["messages"]
+    assert all(message["status"] == "complete" for message in history)
+    assert len(history[1::2]) == 5
+    assert all({source["document_id"] for source in message["sources"]} == {document_id}
+               for message in history[1::2])
+
+    for general in ("Как изменилась погода?", "Что такое креатинин?", "А как устроена турбина?"):
+        events = send_events(client, cid, general)
+        assert events[-1]["sources"] == []
+        assert json.loads(prompts[-1][-1]["content"])["sources"] == []
+
+    fixture = next(item for item in load_fixtures() if item.id == "04-multipage")
+    current_text = ""
+    locators = []
+    records = []
+    for page_number, page in enumerate(fixture.pages, 1):
+        start = len(current_text)
+        for row_number, (name, value, unit, reference, when) in enumerate(page.rows, 1):
+            current_text += f"{name}: {value} {unit} ({when})\n"
+            y = row_number * 20
+            records.append({
+                "name": name, "value": value, "unit": unit, "reference": reference, "date": when,
+                "confirmation": "confirmed",
+                "source": {"page": page_number, "bbox": [10, y, 100, y + 10]},
+            })
+        locators.append({
+            "kind": "page", "index": page_number, "start": start, "end": len(current_text),
+        })
+    current_id = uuid4()
+    with Session(routes.get_engine()) as db:
+        db.add(DocumentTextVersion(
+            id=current_id, document_id=UUID(document_id), version=2, normalized_text=current_text,
+            locators=locators, extractor_version="synthetic", structured_result={
+                "schema_version": 1,
+                "local": {
+                    "provider": "pymupdf_tables", "provider_version": "synthetic",
+                    "measurements": records,
+                },
+            },
+        ))
+        db.commit()
+    events = send_events(client, cid, "Какова разница по креатинину в процентах?")
+    assert "+0.13 mg/dL" in events[1]["text"] and "+14.29%" in events[1]["text"]
+    assert {source["text_version_id"] for source in events[-1]["sources"]} == {str(current_id)}
+
+    call_count = len(prompts)
+    events = send_events(client, cid, "Как изменились показатели альбумина и калия?")
+    assert events[-1]["type"] == "done" and len(prompts) == call_count
+    albumin, potassium = events[1]["text"].split("\n\n")
+    assert all(text in albumin for text in ("Albumin", "2026-10-02", "2026-10-16", "+0.00%"))
+    assert "Potassium" in potassium and "Недостаточно измерений" in potassium
+    assert "%" not in potassium and "Creatinine" not in events[1]["text"]
+    sources = events[-1]["sources"]
+    assert {source["text_version_id"] for source in sources} == {str(current_id)}
+    assert {source["source_url"].rsplit("#", 1)[-1] for source in sources} == {
+        "source-page-1", "source-page-2",
+    }
+
+    events = send_events(client, cid, "Как изменился креатинин в документе №2?")
+    assert "+100 мкмоль/л" in events[1]["text"] and "+200.00%" in events[1]["text"]
+    assert {source["document_id"] for source in events[-1]["sources"]} == {
+        other["payload"]["document_id"],
+    }
+    another = client.post("/chat").json()["id"]
+    events = send_events(client, another, question)
+    assert events[-1]["sources"] == []
+    assert json.loads(prompts[-1][-1]["content"])["sources"] == []
 
 
 def test_structured_chat_routes_direct_measurements_and_deviations(setup, monkeypatch):
@@ -460,7 +601,7 @@ def test_structured_chat_routes_direct_measurements_and_deviations(setup, monkey
         sent = json.loads(request.content)
         assert "format" not in sent
         model_requests.append(sent["messages"])
-        content = f"{text} {glucose}"
+        content = f"{text} {glucose} [S1]"
         return httpx.Response(200, content=(
             json.dumps({"message": {"content": content}}) + '\n{"done":true}\n'
         ).encode())
@@ -473,6 +614,14 @@ def test_structured_chat_routes_direct_measurements_and_deviations(setup, monkey
     answer = "".join(event["text"] for event in events if event["type"] == "delta")
     assert events[-1]["type"] == "done" and text in answer and glucose in answer
     assert all(answer.count(number) == 1 for number in ("132", "6,4", "5,20"))
+    assert "[S1]" in answer
+    (cited,) = [source for source in events[-1]["sources"] if source.get("source_id") == "S1"]
+    assert cited["source_url"].endswith("#source-page-1")
+    history = client.get(f"/chat/{cid}").json()["messages"]
+    assert [message["status"] for message in history[-2:]] == ["complete", "complete"]
+    assert history[-1]["content"] == answer
+    assert history[-1]["sources"] == events[-1]["sources"]
+    assert "source_id" not in history[1]["sources"][0]
     payload = json.loads(model_requests[0][-1]["content"])
     assert payload["question"] == question
     assert [source["confirmed_measurement"]["name"] for source in payload["sources"]

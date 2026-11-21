@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 from collections import Counter, defaultdict
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -23,14 +24,24 @@ from app.documents.extraction_data import (
     strict_text,
 )
 
-Mode = Literal["results", "comparison", "deviations", "trend"]
+Mode = Literal["results", "comparison", "deviations", "trend", "change"]
 ReferencePosition = Literal["ниже", "выше", "в интервале"]
+_NAME_WORD = re.compile(r"[^\W_]+")
+_CASE_ENDINGS = (
+    "иями", "ями", "ами", "ией", "ием", "ого", "ему", "ыми", "ими", "ах", "ях", "ам", "ям",
+    "ом", "ем", "ов", "ев", "ой", "ей", "ый", "ий", "ая", "яя", "ое", "ее", "ую", "юю",
+    "а", "я", "у", "ю", "е", "ы", "и", "о", "ь", "й",
+)
 
 
 def measurement_mode(question: str, overview: Overview | None) -> Mode | None:
     query = " ".join(normalized(question).split())
     if re.search(r"\b(?:динамик\w*|тренд\w*|trend)\b", query):
         return "trend"
+    if re.search(
+        r"\b(?:изменил\w*|изменени\w*|разниц\w*|chang(?:e[ds]?|ing)|difference)\b", query,
+    ):
+        return "change"
     if re.search(
         r"\b(?:отклонени\w*|отклоня\w*|за (?:предел\w* )?норм\w*|вне норм\w*|out of range)\b",
         query,
@@ -51,6 +62,31 @@ def analyte(name: str) -> str:
 
 def comparable_name(name: str) -> str:
     return normalized(" ".join(name.split()))
+
+
+def case_forms(word: str) -> set[str]:
+    return {word} | {
+        word[:-len(ending)] for ending in _CASE_ENDINGS
+        if len(word) >= len(ending) + 4 and word.endswith(ending)
+    }
+
+
+def series_targets(question: str, names: Iterable[str]) -> dict[str, str]:
+    targets = dict(indicator_names(question))
+    words = [case_forms(word) for word in _NAME_WORD.findall(normalized(question))]
+    for name in names:
+        if indicator_key(name) is not None:
+            continue
+        terms = [case_forms(word) for word in _NAME_WORD.findall(normalized(name))]
+        if terms and any(
+            all(
+                term & word
+                for term, word in zip(terms, words[start:start + len(terms)], strict=True)
+            )
+            for start in range(len(words) - len(terms) + 1)
+        ):
+            targets.setdefault(analyte(name), name)
+    return targets
 
 
 def key_for(row: StoredMeasurement) -> tuple[str | None, ...]:
@@ -205,20 +241,28 @@ def trend(records: list[Record], *, partial: bool) -> list[str]:
             continue
         item = items[0]
         result.append(f"• {when} · документ № {item.document_number} · {show(item.row)}")
+    if len(dated) < 2:
+        result.append("Недостаточно измерений для расчёта динамики.")
     if not partial and len(dated) >= 2 and all(len(items) == 1 for items in dated.values()):
         first, last = dated[min(dated)][0], dated[max(dated)][0]
         a, b = scalar(first.row.value), scalar(last.row.value)
         units = {items[0].unit for items in dated.values()}
         if len(units) == 1 and None not in units and a and b and not a[0] and not b[0]:
+            difference = b[1] - a[1]
             result.append(
-                f"Изменение между первой и последней датой: {b[1] - a[1]:+f} {first.row.unit}."
+                f"Изменение между первой и последней датой: {difference:+f} {first.row.unit}."
             )
+            if a[1] != 0:
+                percent = difference / a[1] * 100
+                result.append(f"Процентное изменение: {percent:+.2f}%.")
+            else:
+                result.append("Процентное изменение не определено при исходном значении 0.")
     return result
 
 
 def structured_context(
     extractions: list[Extraction], mode: Mode, question: str, budget: int,
-    *, targets: set[str] | None = None,
+    *, targets: set[str] | None = None, earlier_questions: Sequence[str] = (),
 ) -> OverviewContext | None:
     if not any(item.version.structured_result is not None for item in extractions):
         return None
@@ -232,24 +276,25 @@ def structured_context(
         except ValidationError:
             stored = None
         decoded.append((item, stored))
-    if targets is None:
-        targets = {key for key, _ in indicator_names(question)} if mode in (
-            "trend", "deviations",
-        ) else set()
-    if mode == "trend":
-        if not targets:
-            query = normalized(question)
-            for _, stored in decoded:
-                if stored is None:
-                    continue
-                for report in (stored.local, stored.external):
-                    if report:
-                        targets.update(
-                            analyte(row.name) for row in report.measurements
-                            if re.search(rf"(?<!\w){re.escape(analyte(row.name))}(?!\w)", query)
-                        )
-        if len(targets) != 1:
-            return OverviewContext("Для динамики укажите один показатель.", [])
+    time_series = mode in ("trend", "change")
+    labels: dict[str, str] = {}
+    if time_series:
+        names = dict.fromkeys(
+            row.name for _, stored in decoded if stored is not None
+            for report in (stored.local, stored.external) if report is not None
+            for row in report.measurements
+        )
+        for candidate in (question, *earlier_questions):
+            labels = series_targets(candidate, names)
+            if labels:
+                break
+        if not labels:
+            if mode == "trend":
+                return OverviewContext("Для динамики укажите показатель.", [])
+            return None
+        targets = set(labels)
+    elif targets is None:
+        targets = {key for key, _ in indicator_names(question)} if mode == "deviations" else set()
     all_records: list[Record] = []
     visible: list[Record] = []
     groups: list[str] = []
@@ -284,7 +329,7 @@ def structured_context(
         for index, record in enumerate(records):
             if statuses and statuses[index] not in ("ниже", "выше"):
                 continue
-            if mode == "trend" and observed_date(record.row.date) is None:
+            if time_series and observed_date(record.row.date) is None:
                 continue
             cost = len(record.hit["text"])
             if cost > remaining:
@@ -294,7 +339,7 @@ def structured_context(
             remaining -= cost
             visible.append(record)
             lines.append(f"• {record.hit['text']}")
-        if mode != "trend":
+        if not time_series:
             empty = "Подтверждённые измерения не поместились в ответ." if records else (
                 "Подтверждённых измерений нет."
             )
@@ -325,14 +370,15 @@ def structured_context(
         groups.append("\n".join(["Сопоставимые измерения", *pairs]) if pairs else (
             "Однозначные пары с одинаковыми единицами не найдены."
         ))
-    if mode == "trend":
+    if time_series:
         series: dict[str, list[Record]] = defaultdict(list)
         for record in visible:
-            series[comparable_name(record.row.name)].append(record)
-        for records in series.values():
-            groups.append("\n".join([records[0].row.name, *trend(records, partial=partial)]))
-        if not series:
-            groups.append("Подтверждённых измерений с датой в выдаче нет.")
+            series[analyte(record.row.name)].append(record)
+        for key, label in labels.items():
+            if points := series.get(key):
+                groups.append("\n".join([points[0].row.name, *trend(points, partial=partial)]))
+            else:
+                groups.append(f"{label}: подтверждённых измерений с датой нет в ответе.")
     if partial:
         groups.append("Часть измерений могла быть пропущена при извлечении или подготовке ответа.")
     hits = [record.hit for record in visible] + legacy_hits

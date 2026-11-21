@@ -61,6 +61,7 @@ _INDICATORS = re.compile(
     r"(?P<calcium>кальци[йяюеи]|calcium)|(?P<magnesium>магни[йяюеи]|magnesium)|"
     r"(?P<fasting_glucose>глюкоз\w* натощак|fasting (?:blood )?glucose)|"
     r"(?P<glucose>глюкоз\w*|(?:blood )?glucose)|(?P<creatinine>креатинин\w*|creatinine)|"
+    r"(?P<albumin>альбумин(?:а|у|ом|е|ы|ов|ам|ами|ах)?|albumin)|"
     r"(?P<ferritin>ферритин\w*|ferritin)|(?P<crp>срб|crp|[сc]-реактивн\w* бел\w*|"
     r"c-reactive protein)|(?P<wbc>лейкоцит(?:ы|ов|ам|ами|ах|а|у|ом|е)?|leukocytes|wbc)|"
     r"(?P<plt>тромбоцит(?:ы|ов|ам|ами|ах|а|у|ом|е)?|platelets|plt)|"
@@ -80,6 +81,7 @@ _INDICATOR_LABELS = {
     "fasting_glucose": "Глюкоза натощак",
     "glucose": "Глюкоза",
     "creatinine": "Креатинин",
+    "albumin": "Альбумин",
     "ferritin": "Ферритин",
     "crp": "С-реактивный белок",
     "wbc": "Лейкоциты",
