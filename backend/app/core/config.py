@@ -7,6 +7,8 @@ from urllib.parse import quote
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+KNOWLEDGE_COLLECTION = "medical_ai_knowledge_hybrid_v1"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="", extra="ignore")
@@ -90,6 +92,8 @@ class Settings(BaseSettings):
             raise ValueError("GigaChat context must leave space for prompts and tool results")
         if self.rag_chunk_overlap >= self.rag_chunk_chars:
             raise ValueError("RAG chunk overlap must be smaller than chunk size")
+        if self.rag_collection == KNOWLEDGE_COLLECTION:
+            raise ValueError("Personal RAG collection conflicts with medical knowledge")
         if self.rag_embedding_digest and not re.fullmatch(
             r"[0-9a-f]{64}",
             self.rag_embedding_digest,

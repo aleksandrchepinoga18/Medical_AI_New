@@ -5,6 +5,7 @@ from app.auth.models import Base
 from app.chat import models as chat_models  # noqa: F401
 from app.db import database_url, get_settings
 from app.documents import models as document_models  # noqa: F401
+from app.knowledge import models as knowledge_models  # noqa: F401
 from app.rag import models as rag_models  # noqa: F401
 
 

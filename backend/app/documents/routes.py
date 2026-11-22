@@ -108,7 +108,9 @@ Storage = Annotated[ObjectStorage, Depends(get_storage)]
 
 
 @asynccontextmanager
-async def upload_file(request: Request) -> AsyncIterator[UploadFile]:
+async def bounded_upload_form(
+    request: Request, *, metadata: bool = False,
+) -> AsyncIterator[FormData]:
     maximum = get_settings().documents_max_bytes
     envelope_limit = maximum + 65536
     if "multipart/form-data" not in request.headers.get("content-type", "").lower():
@@ -140,8 +142,8 @@ async def upload_file(request: Request) -> AsyncIterator[UploadFile]:
                 request.headers,
                 limited_stream(),
                 max_files=1,
-                max_fields=0,
-                max_part_size=maximum,
+                max_fields=int(metadata),
+                max_part_size=16384 if metadata else maximum,
             ).parse()
     except TimeoutError:
         raise HTTPException(408, "Upload timed out") from None
@@ -149,14 +151,27 @@ async def upload_file(request: Request) -> AsyncIterator[UploadFile]:
         raise HTTPException(413 if exceeded else 400, "Invalid or oversized upload") from None
     try:
         file = form.get("file")
-        if len(form.multi_items()) != 1 or not isinstance(file, UploadFile):
+        expected = ["file", "metadata"] if metadata else ["file"]
+        if sorted(key for key, _ in form.multi_items()) != expected or not isinstance(
+            file, UploadFile
+        ):
             raise HTTPException(400, "Exactly one file field is required")
+        if metadata and not isinstance(form.get("metadata"), str):
+            raise HTTPException(400, "Metadata must be a text field")
         if file.size is None or file.size > maximum:
             raise HTTPException(413, "File is too large")
-        yield file
+        yield form
     finally:
         with CancelScope(shield=True):
             await form.close()
+
+
+@asynccontextmanager
+async def upload_file(request: Request) -> AsyncIterator[UploadFile]:
+    async with bounded_upload_form(request) as form:
+        file = form["file"]
+        assert isinstance(file, UploadFile)
+        yield file
 
 
 @router.post("", status_code=202, response_model=DocumentView)

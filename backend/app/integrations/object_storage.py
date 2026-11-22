@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from tempfile import SpooledTemporaryFile
-from typing import Protocol, cast
+from typing import Protocol, Self, cast
 from uuid import UUID, uuid4
 
 from minio import Minio
@@ -129,7 +129,7 @@ class ObjectStorage:
         self._max_bytes = settings.documents_max_bytes
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> "ObjectStorage":
+    def from_settings(cls, settings: Settings) -> Self:
         validate_storage_settings(settings)
         client = Minio(
             settings.documents_s3_endpoint,
@@ -150,10 +150,13 @@ class ObjectStorage:
         *,
         object_key: str | None = None,
     ) -> StoredOriginal:
-        if document_format not in CONTENT_TYPES:
-            raise ValueError("Only PDF and DOCX originals are supported")
         key = object_key or make_object_key(owner_id, document_id)
         validate_object_key(owner_id, document_id, key)
+        return self._upload(key, source, document_format)
+
+    def _upload(self, key: str, source: BinaryReader, document_format: str) -> StoredOriginal:
+        if document_format not in CONTENT_TYPES:
+            raise ValueError("Only PDF and DOCX originals are supported")
         checksum = hashlib.sha256()
         size = 0
         with SpooledTemporaryFile(max_size=1048576, mode="w+b") as staged:
@@ -185,6 +188,11 @@ class ObjectStorage:
         self, owner_id: UUID, document_id: UUID, object_key: str
     ) -> Iterator[ObjectResponse]:
         validate_object_key(owner_id, document_id, object_key)
+        with self._open(object_key) as response:
+            yield response
+
+    @contextmanager
+    def _open(self, object_key: str) -> Iterator[ObjectResponse]:
         try:
             response = self._client.get_object(self._bucket, object_key)
         except S3Error as error:

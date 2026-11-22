@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Callable, Iterator
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
@@ -14,6 +15,10 @@ from app.core.config import Settings
 from app.rag.chunking import Chunk
 
 PIPELINE = "medical-ai-personal-v1"
+PERSONAL_PAYLOAD_INDEXES = (
+    "pipeline", "user_id", "document_id", "text_version_id",
+    "generation", "fingerprint", "chunk_id",
+)
 
 
 class RagError(Exception):
@@ -150,6 +155,18 @@ class OllamaEmbeddings:
         return checked
 
 
+def embed_chunk_batches(
+    embeddings: OllamaEmbeddings,
+    chunks: list[Chunk],
+    batch_size: int,
+    check_deadline: Callable[[], None],
+) -> Iterator[tuple[list[Chunk], list[list[float]]]]:
+    for offset in range(0, len(chunks), batch_size):
+        check_deadline()
+        batch = chunks[offset : offset + batch_size]
+        yield batch, embeddings.embed([chunk.text for chunk in batch])
+
+
 def match(key: str, value: str) -> dict[str, Any]:
     return {"key": key, "match": {"value": value}}
 
@@ -165,17 +182,14 @@ def generation_filter(settings: Settings, user_id: UUID, generations: list[str])
     }
 
 
-def ensure_payload_indexes(http: JsonHttp, path: str, info: dict[str, Any]) -> None:
+def ensure_payload_indexes(
+    http: JsonHttp,
+    path: str,
+    info: dict[str, Any],
+    fields: tuple[str, ...] = PERSONAL_PAYLOAD_INDEXES,
+) -> None:
     schema = info.get("payload_schema", {})
-    for field in (
-        "pipeline",
-        "user_id",
-        "document_id",
-        "text_version_id",
-        "generation",
-        "fingerprint",
-        "chunk_id",
-    ):
+    for field in fields:
         if field in schema:
             if schema[field].get("data_type") != "keyword":
                 raise RagError("PAYLOAD_INDEX_MISMATCH")
@@ -188,6 +202,8 @@ def ensure_payload_indexes(http: JsonHttp, path: str, info: dict[str, Any]) -> N
 
 
 class QdrantVectors:
+    payload_indexes = PERSONAL_PAYLOAD_INDEXES
+
     def __init__(self, settings: Settings) -> None:
         if not re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", settings.rag_collection):
             raise RagError("INVALID_COLLECTION")
@@ -234,7 +250,7 @@ class QdrantVectors:
                 if conflict.code not in {"HTTP_400", "HTTP_409"}:
                     raise
             info = self.inspect()
-        ensure_payload_indexes(self.http, self.path, info)
+        ensure_payload_indexes(self.http, self.path, info, self.payload_indexes)
 
     def upsert(
         self,

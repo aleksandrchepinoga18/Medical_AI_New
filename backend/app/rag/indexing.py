@@ -11,7 +11,13 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.documents.models import Document, DocumentTextVersion
-from app.rag.adapters import OllamaEmbeddings, QdrantVectors, RagError, fingerprint
+from app.rag.adapters import (
+    OllamaEmbeddings,
+    QdrantVectors,
+    RagError,
+    embed_chunk_batches,
+    fingerprint,
+)
 from app.rag.bm25_index import delete_copies, sync_published
 from app.rag.chunking import chunk_text
 from app.rag.models import RagChunk, RagIndexJob
@@ -159,12 +165,11 @@ def _process_index(
         if operation == "index" and not chunks:
             raise RagError("NO_TEXT")
         if operation == "index":
-            batch_size = settings.rag_embedding_batch_size
-            for offset in range(0, len(chunks), batch_size):
-                check_deadline()
-                batch = chunks[offset : offset + batch_size]
-                values = embeddings.embed([chunk.text for chunk in batch])
-                if offset == 0:
+            batches = embed_chunk_batches(
+                embeddings, chunks, settings.rag_embedding_batch_size, check_deadline,
+            )
+            for batch_number, (batch, values) in enumerate(batches):
+                if batch_number == 0:
                     vectors.ensure()  # Real embedding dimensions validated before creation.
                 check_deadline()
                 vectors.upsert(user_id, document_id, version_id, token, batch, values)

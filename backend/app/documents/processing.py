@@ -1,6 +1,6 @@
 import hashlib
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version as package_version
 from pathlib import Path
@@ -19,30 +19,46 @@ from app.documents.models import Document, DocumentIngestionJob, DocumentTextVer
 from app.documents.providers import ProcessingError as ProcessingError
 from app.documents.providers import confirm_sources, extraction_provider
 from app.documents.schemas import VERSION_REQUEST, ExternalAuthorization, VersionRequest
-from app.integrations.object_storage import ObjectStorage, OriginalNotFound, StorageError
+from app.integrations.object_storage import (
+    ObjectResponse,
+    ObjectStorage,
+    OriginalNotFound,
+    StorageError,
+)
 from app.rag.service import enqueue, latest_version
 
 
-@contextmanager
 def verified_original(
     document: Document, storage: ObjectStorage, settings: Settings, deadline: float,
+) -> AbstractContextManager[Path]:
+    return verified_file(
+        storage.open_original(document.owner_id, document.id, document.object_key),
+        document.size_bytes, document.sha256, settings.documents_max_bytes, deadline,
+    )
+
+
+@contextmanager
+def verified_file(
+    original: AbstractContextManager[ObjectResponse],
+    expected_size: int,
+    expected_sha256: str,
+    maximum_size: int,
+    deadline: float,
 ) -> Iterator[Path]:
     with TemporaryDirectory(prefix="medical-ingestion-") as directory:
         source = Path(directory) / "original"
         digest, size = hashlib.sha256(), 0
         with source.open("wb") as file:
-            with storage.open_original(
-                document.owner_id, document.id, document.object_key
-            ) as response:
+            with original as response:
                 while chunk := response.read(65536):
                     if monotonic() >= deadline:
                         raise ProcessingError("PROCESSING_TIMEOUT")
                     size += len(chunk)
-                    if size > settings.documents_max_bytes or size > document.size_bytes:
+                    if size > maximum_size or size > expected_size:
                         raise ProcessingError("CHECKSUM_MISMATCH")
                     digest.update(chunk)
                     file.write(chunk)
-        if size != document.size_bytes or digest.hexdigest() != document.sha256:
+        if size != expected_size or digest.hexdigest() != expected_sha256:
             raise ProcessingError("CHECKSUM_MISMATCH")
         yield source
 

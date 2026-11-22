@@ -58,10 +58,13 @@ class QdrantHybrid(QdrantVectors):
         return dict(result)
 
     def count(self, user_id: UUID, generations: list[str]) -> int:
+        return self.count_scoped(generation_filter(self.settings, user_id, generations))
+
+    def count_scoped(self, scoped: dict[str, Any]) -> int:
         result = self.http.request(
             "POST",
             self.path + "/points/count",
-            {"filter": generation_filter(self.settings, user_id, generations), "exact": True},
+            {"filter": scoped, "exact": True},
         )
         try:
             count = result["result"]["count"]
@@ -80,10 +83,20 @@ class QdrantHybrid(QdrantVectors):
         expected: int,
         k: int,
     ) -> list[dict[str, Any]]:
-        self.inspect()
-        if self.count(user_id, generations) != expected:
-            raise RagError("HYBRID_COVERAGE_INCOMPLETE")
         scoped = generation_filter(self.settings, user_id, generations)
+        return self.query_scoped(vector, text, scoped, expected, k)
+
+    def query_scoped(
+        self,
+        vector: list[float],
+        text: str,
+        scoped: dict[str, Any],
+        expected: int,
+        k: int,
+    ) -> list[dict[str, Any]]:
+        self.inspect()
+        if self.count_scoped(scoped) != expected:
+            raise RagError("HYBRID_COVERAGE_INCOMPLETE")
         result = self.http.request(
             "POST",
             self.path + "/points/query",

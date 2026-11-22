@@ -41,8 +41,9 @@ def listed_values(output: str) -> set[str]:
 
 
 def main() -> None:
-    if sys.argv[1:] != ["provision"]:
-        raise RuntimeError("Explicit 'provision' argument required")
+    if sys.argv[1:] not in (["provision"], ["provision-knowledge"]):
+        raise RuntimeError("Explicit 'provision' or 'provision-knowledge' argument required")
+    knowledge = sys.argv[1] == "provision-knowledge"
     bucket = os.environ.get("DOCUMENTS_S3_BUCKET", "medical-ai-documents")
     access = os.environ.get("DOCUMENTS_S3_ACCESS_KEY", "")
     secret = os.environ.get("DOCUMENTS_S3_SECRET_KEY", "")
@@ -69,6 +70,26 @@ def main() -> None:
     buckets = listed_values(run_mc("ls", "--json", "storage"))
     users = listed_values(run_mc("admin", "user", "list", "--json", "storage"))
     policies = listed_values(run_mc("admin", "policy", "list", "--json", "storage"))
+    if knowledge:
+        if bucket not in buckets or access not in users or policy_name not in policies:
+            raise RuntimeError("Provision document storage first")
+        policy_name = "medical-ai-knowledge-storage"
+        if policy_name in policies:
+            raise RuntimeError("Knowledge policy already exists; refusing to overwrite")
+        policy = {
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"],
+                "Resource": [f"arn:aws:s3:::{bucket}/knowledge/*"],
+            }],
+        }
+        path = Path("/tmp/knowledge-policy.json")
+        path.write_text(json.dumps(policy), encoding="utf-8")
+        run_mc("admin", "policy", "create", "storage", policy_name, str(path))
+        run_mc("admin", "policy", "attach", "storage", policy_name, "--user", access)
+        print("Knowledge prefix policy attached to the document storage account.")
+        return
     if bucket in buckets or access in users or policy_name in policies:
         raise RuntimeError("Document bucket, user or policy already exists; refusing to overwrite")
     policy = {
