@@ -14,8 +14,14 @@ from app.documents.processing import verified_file
 from app.documents.providers import ProcessingError, extraction_provider
 from app.documents.validation import inspect_upload
 from app.integrations.object_storage import StorageError
-from app.knowledge.models import MedicalChunk, MedicalSource, MedicalVersion
-from app.knowledge.schemas import SourceMetadata, SourceUpload, StatusChange, VersionView
+from app.knowledge.models import KnowledgeAdmin, MedicalChunk, MedicalSource, MedicalVersion
+from app.knowledge.schemas import (
+    ReviewPublishRequest,
+    SourceMetadata,
+    SourceUpload,
+    StatusChange,
+    VersionView,
+)
 from app.knowledge.storage import KnowledgeStorage
 from app.knowledge.vectors import KNOWLEDGE_PIPELINE, KnowledgeVectors
 from app.rag.adapters import OllamaEmbeddings, RagError, embed_chunk_batches, fingerprint
@@ -146,10 +152,20 @@ def change_status(
     db: Session, settings: Settings, source_id: UUID, reviewer_id: UUID, change: StatusChange,
 ) -> dict[str, Any]:
     source, version = source_and_version(db, source_id, change.version_id)
+    apply_status(db, settings, version, reviewer_id, change)
+    result = source_snapshot(source, version)
+    db.commit()
+    return result
+
+
+def apply_status(
+    db: Session, settings: Settings, version: MedicalVersion, reviewer_id: UUID,
+    change: StatusChange,
+) -> None:
     if change.status == "verified" and change.review_revision != version.review_revision:
         raise HTTPException(409, "Medical source review revision changed")
     if change.status == version.status:
-        return source_snapshot(source, version)
+        return
     if change.status not in TRANSITIONS[version.status]:
         raise HTTPException(409, "Invalid medical source status transition")
     if change.status == "verified":
@@ -167,10 +183,9 @@ def change_status(
             raise HTTPException(409, "Medical source index is incomplete")
     elif change.status == "rejected":
         version.reviewed_by = version.reviewed_at = version.review_note = None
+    if change.status in {"outdated", "rejected"}:
+        version.review_revision = uuid4()
     version.status = change.status
-    result = source_snapshot(source, version)
-    db.commit()
-    return result
 
 
 def index_complete(vectors: KnowledgeVectors, version: MedicalVersion) -> bool:
@@ -191,17 +206,26 @@ def index_source(
     version_id: UUID,
 ) -> dict[str, Any]:
     source, version = source_and_version(db, source_id, version_id)
+    write_index(db, settings, storage, version)
+    result = source_snapshot(source, version)
+    db.commit()
+    return result
+
+
+def write_index(
+    db: Session, settings: Settings, storage: KnowledgeStorage, version: MedicalVersion,
+) -> None:
     if version.status not in {"verified", "published"}:
         raise HTTPException(409, "Medical source must be verified before indexing")
     reject_personal_original(db, version.sha256)
     current_fingerprint = fingerprint(settings)
     vectors = KnowledgeVectors(settings)
     if version.fingerprint == current_fingerprint and index_complete(vectors, version):
-        return source_snapshot(source, version)
+        return
 
     processing_deadline = monotonic() + settings.documents_processing_seconds
     with verified_file(
-        storage.open_version(source.id, version.id),
+        storage.open_version(version.source_id, version.id),
         version.size_bytes, version.sha256, settings.documents_max_bytes,
         processing_deadline,
     ) as original:
@@ -228,9 +252,9 @@ def index_source(
     for batch_number, (batch, values) in enumerate(batches):
         if batch_number == 0:
             vectors.ensure()
-            vectors.remove_old_generations(source.id, version.generation)
+            vectors.remove_old_generations(version.source_id, version.generation)
         check_deadline()
-        vectors.write_batch(source.id, version.id, generation, batch, values)
+        vectors.write_batch(version.source_id, version.id, generation, batch, values)
     check_deadline()
     if vectors.count_scoped(vectors.scope([str(generation)])) != len(chunks):
         raise RagError("HYBRID_COVERAGE_INCOMPLETE")
@@ -247,6 +271,40 @@ def index_source(
     version.generation = generation
     version.fingerprint = current_fingerprint
     version.chunk_count = len(chunks)
+
+
+def review_and_publish(
+    db: Session, settings: Settings, storage: KnowledgeStorage, source_id: UUID,
+    reviewer_id: UUID, review: ReviewPublishRequest,
+) -> dict[str, Any]:
+    source, version = source_and_version(db, source_id, review.version_id)
+    if version.review_revision != review.review_revision:
+        raise HTTPException(409, "Medical source review revision changed")
+    if version.sha256 != review.verified_sha256:
+        raise HTTPException(422, "Medical source checksum changed")
+    if version.status == "published":
+        return source_snapshot(source, version)
+    if version.status != "verified":
+        apply_status(db, settings, version, reviewer_id, StatusChange(
+            version_id=review.version_id, status="verified", review_revision=review.review_revision,
+            verified_sha256=review.verified_sha256,
+            review_note="Administrator reviewed the original and confirmed full-text reuse rights.",
+        ))
+        db.commit()  # Keep the review if indexing fails. Recheck it under the next source lock.
+        source, version = source_and_version(db, source_id, review.version_id)
+        if version.review_revision != review.review_revision:
+            raise HTTPException(409, "Medical source review revision changed")
+        if version.status == "published":
+            return source_snapshot(source, version)
+    write_index(db, settings, storage, version)
+    if db.scalar(
+        select(KnowledgeAdmin.user_id).where(KnowledgeAdmin.user_id == reviewer_id)
+    ) is None:
+        raise HTTPException(403, "Medical knowledge administrator required")
+    apply_status(
+        db, settings, version, reviewer_id,
+        StatusChange(version_id=review.version_id, status="published"),
+    )
     result = source_snapshot(source, version)
     db.commit()
     return result

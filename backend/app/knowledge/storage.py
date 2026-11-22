@@ -1,7 +1,9 @@
+from collections.abc import Iterator
 from contextlib import AbstractContextManager
 from uuid import UUID
 
 from app.integrations.object_storage import (
+    CHUNK_BYTES,
     BinaryReader,
     ObjectResponse,
     ObjectStorage,
@@ -23,3 +25,8 @@ class KnowledgeStorage(ObjectStorage):
         self, source_id: UUID, version_id: UUID,
     ) -> AbstractContextManager[ObjectResponse]:
         return self._open(knowledge_key(source_id, version_id))
+
+    def stream_version(self, source_id: UUID, version_id: UUID) -> Iterator[bytes]:
+        with self.open_version(source_id, version_id) as response:
+            while chunk := response.read(CHUNK_BYTES):
+                yield chunk

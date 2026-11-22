@@ -42,7 +42,7 @@ async function checked(response: Response): Promise<Response> {
   return response;
 }
 
-async function csrf(): Promise<string> {
+export async function csrf(): Promise<string> {
   const response = await checked(await fetch("/api/auth/csrf", { cache: "no-store" }));
   return (await response.json()).csrf_token;
 }

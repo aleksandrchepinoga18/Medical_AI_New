@@ -80,6 +80,12 @@ class IndexRequest(KnowledgeInput):
     version_id: UUID
 
 
+class ReviewPublishRequest(KnowledgeInput):
+    version_id: UUID
+    review_revision: UUID
+    verified_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class VersionView(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

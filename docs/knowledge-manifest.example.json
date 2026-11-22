@@ -1,0 +1,23 @@
+{
+  "items": [
+    {
+      "file": "files/synthetic-guide.pdf",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "metadata": {
+        "title": "Synthetic guide",
+        "material_type": "synthetic test",
+        "author": "Synthetic organization",
+        "publisher": "Synthetic publisher",
+        "url": "https://example.org/knowledge/synthetic-guide",
+        "doi": null,
+        "pmid": null,
+        "publication_date": null,
+        "update_date": null,
+        "specialty": "Synthetic",
+        "language": "en",
+        "jurisdiction": "Synthetic",
+        "version": "1"
+      }
+    }
+  ]
+}

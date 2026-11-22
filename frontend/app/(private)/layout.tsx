@@ -2,6 +2,7 @@ import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import type { ReactNode } from "react";
 import { AppShell } from "../../components/app-shell";
+import { hasKnowledgeAccess } from "../../lib/knowledge-access";
 
 export const dynamic = "force-dynamic";
 
@@ -14,5 +15,5 @@ export default async function PrivateLayout({ children }: { children: ReactNode 
   });
   if (response.status === 401) redirect("/login");
   if (!response.ok) throw new Error("Сервис авторизации временно недоступен");
-  return <AppShell>{children}</AppShell>;
+  return <AppShell knowledgeAdmin={await hasKnowledgeAccess(token)}>{children}</AppShell>;
 }

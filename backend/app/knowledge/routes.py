@@ -1,3 +1,5 @@
+from collections.abc import Iterator
+from contextlib import contextmanager
 from functools import lru_cache
 from typing import Annotated, Any
 from uuid import UUID
@@ -12,11 +14,17 @@ from app.auth.routes import DB, AuthenticatedUser
 from app.core.config import Settings
 from app.db import get_settings
 from app.documents.providers import ProcessingError
-from app.documents.routes import bounded_upload_form, require_session_cookie
+from app.documents.routes import OriginalResponse, bounded_upload_form, require_session_cookie
 from app.integrations.object_storage import OriginalNotFound, StorageError
 from app.knowledge import service
 from app.knowledge.models import KnowledgeAdmin, MedicalSource, MedicalVersion
-from app.knowledge.schemas import IndexRequest, SourceMetadata, SourceUpload, StatusChange
+from app.knowledge.schemas import (
+    IndexRequest,
+    ReviewPublishRequest,
+    SourceMetadata,
+    SourceUpload,
+    StatusChange,
+)
 from app.knowledge.storage import KnowledgeStorage
 from app.rag.adapters import RagError
 from app.rag.routes import SearchRequest
@@ -34,6 +42,11 @@ def require_admin(db: DB, user: AuthenticatedUser) -> UUID:
 
 Admin = Annotated[UUID, Depends(require_admin)]
 Config = Annotated[Settings, Depends(get_settings)]
+
+
+@router.get("/access", status_code=204, dependencies=[Depends(require_admin)])
+def access(response: Response) -> None:
+    response.headers["Cache-Control"] = "no-store"
 
 
 @lru_cache
@@ -100,6 +113,35 @@ def edit_source(
     return service.update_metadata(db, source_id, data)
 
 
+@router.get(
+    "/sources/{source_id}/versions/{version_id}/original", dependencies=[Depends(require_admin)],
+)
+def download_original(source_id: UUID, version_id: UUID, db: DB) -> Response:
+    version = db.scalar(select(MedicalVersion).where(
+        MedicalVersion.id == version_id, MedicalVersion.source_id == source_id,
+        MedicalVersion.is_current,
+    ))
+    if version is None:
+        raise HTTPException(404, "Medical source version not found")
+    extension = "pdf" if version.format == "pdf" else "docx"
+    name = f"medical-source-{source_id}-{version_id}.{extension}"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{name}"',
+        "Content-Length": str(version.size_bytes),
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+    }
+    db.rollback()  # Release the DB connection before starting the download.
+    stream = get_storage().stream_version(source_id, version_id)
+    try:
+        first = next(stream)
+    except OriginalNotFound:
+        raise HTTPException(404, "Medical source original not found") from None
+    except (StorageError, StopIteration):
+        raise HTTPException(503, "Medical source original unavailable") from None
+    return OriginalResponse(stream, first, headers)
+
+
 @router.put("/sources/{source_id}/version")
 async def replace_version(
     source_id: UUID, request: Request, response: Response, db: DB, admin: Admin, settings: Config,
@@ -119,13 +161,10 @@ def set_status(
         raise HTTPException(503, "Medical source index unavailable") from None
 
 
-@router.post("/sources/{source_id}/index", dependencies=[Depends(require_admin)])
-def start_index(
-    source_id: UUID, data: IndexRequest, response: Response, db: DB, settings: Config,
-) -> dict[str, Any]:
-    response.headers["Cache-Control"] = "no-store"
+@contextmanager
+def indexing_errors() -> Iterator[None]:
     try:
-        return service.index_source(db, settings, get_storage(), source_id, data.version_id)
+        yield
     except (OriginalNotFound, ProcessingError) as error:
         code = "ORIGINAL_MISSING" if isinstance(error, OriginalNotFound) else str(error)
         if code == "PROCESSING_TIMEOUT":
@@ -135,6 +174,25 @@ def start_index(
         ) from None
     except (StorageError, RagError):
         raise HTTPException(503, "Medical source indexing unavailable") from None
+
+
+@router.post("/sources/{source_id}/index", dependencies=[Depends(require_admin)])
+def start_index(
+    source_id: UUID, data: IndexRequest, response: Response, db: DB, settings: Config,
+) -> dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    with indexing_errors():
+        return service.index_source(db, settings, get_storage(), source_id, data.version_id)
+
+
+@router.post("/sources/{source_id}/review-publish")
+def review_publish(
+    source_id: UUID, data: ReviewPublishRequest, response: Response, db: DB,
+    admin: Admin, settings: Config,
+) -> dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    with indexing_errors():
+        return service.review_and_publish(db, settings, get_storage(), source_id, admin, data)
 
 
 @router.post("/search")

@@ -3,12 +3,12 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState, type ReactNode } from "react";
-import { Activity, Files, FlaskConical, LogOut, Menu, MessageSquare, Search, Settings, ShieldCheck } from "lucide-react";
+import { Activity, BookOpen, Files, FlaskConical, LogOut, Menu, MessageSquare, Search, Settings, ShieldCheck } from "lucide-react";
 import { Button } from "./ui/button";
 import { Sheet, SheetContent, SheetDescription, SheetTitle, SheetTrigger } from "./ui/sheet";
 import { cn } from "../lib/utils";
 
-const links = [
+const commonLinks = [
   { href: "/chat", title: "Чат", icon: MessageSquare },
   { href: "/documents", title: "Документы", icon: Files },
   { href: "/search", title: "Поиск", icon: Search },
@@ -16,9 +16,14 @@ const links = [
   { href: "/settings", title: "Настройки", icon: Settings },
 ];
 
-export function AppShell({ children }: { children: ReactNode }) {
+export function AppShell({ children, knowledgeAdmin = false }: {
+  children: ReactNode; knowledgeAdmin?: boolean;
+}) {
   const pathname = usePathname();
   const [open, setOpen] = useState(false);
+  const links = knowledgeAdmin
+    ? [...commonLinks, { href: "/knowledge", title: "Медицинская база знаний", icon: BookOpen }]
+    : commonLinks;
   function navigation() {
     return <nav aria-label="Основная навигация" className="space-y-1.5">
       {links.map(({ href, title, icon: Icon }) => <Link key={href} href={href}

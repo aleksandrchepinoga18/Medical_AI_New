@@ -93,10 +93,12 @@ def test_medical_knowledge_lifecycle(environment, client, monkeypatch):
     synthetic_text = f"Synthetic chart zebra{identity[:12]} for version one."
     original = pdf(synthetic_text)
     with TestClient(app) as anonymous:
+        assert anonymous.get("/knowledge/access").status_code == 401
         assert anonymous.get(REGISTRY).status_code == 401
         assert anonymous.post(
             "/knowledge/search", json={"query": synthetic_text},
         ).status_code == 401
+    assert client.get("/knowledge/access").status_code == 403
     assert client.get(REGISTRY).status_code == 403
     csrf = rag_integration.headers(client)
     assert client.post(REGISTRY, headers=csrf, **multipart(metadata, original)).status_code == 403
@@ -104,6 +106,9 @@ def test_medical_knowledge_lifecycle(environment, client, monkeypatch):
     with Session(engine) as db:
         db.add(KnowledgeAdmin(user_id=admin_id))
         db.commit()
+    access = client.get("/knowledge/access")
+    assert access.status_code == 204
+    assert access.headers["Cache-Control"] == "no-store"
     assert client.post(REGISTRY, **multipart(metadata, original)).status_code == 403
     result = client.post(REGISTRY, headers=csrf, **multipart(metadata, original))
     assert result.status_code == 201, result.text
@@ -112,6 +117,14 @@ def test_medical_knowledge_lifecycle(environment, client, monkeypatch):
     version = source["current_version"]
     version_id = UUID(version["id"])
     path = f"{REGISTRY}/{source_id}"
+    original_path = f"{path}/versions/{version_id}/original"
+    download = client.get(original_path)
+    assert download.status_code == 200
+    assert download.content == original
+    assert download.headers["Content-Disposition"].startswith("attachment;")
+    assert download.headers["Cache-Control"] == "no-store"
+    assert transport.response and transport.response.closed and transport.response.released
+    assert client.get(f"{REGISTRY}/{uuid4()}/versions/{version_id}/original").status_code == 404
     assert source["verification_status"] == "pending"
     assert source["url"] == metadata["url"].split("#")[0]
     assert source["doi"] == metadata["doi"].lower()
@@ -205,6 +218,7 @@ def test_medical_knowledge_lifecycle(environment, client, monkeypatch):
             json={"email": f"{uuid4()}@example.org", "password": "synthetic-reader-password"},
         ).status_code == 201
         assert reader.get(REGISTRY).status_code == 403
+        assert reader.get(original_path).status_code == 403
         assert status(reader, "published").status_code == 403
         assert index_current(reader).status_code == 403
         reader_id = UUID(reader.get("/auth/me").json()["id"])
@@ -249,16 +263,37 @@ def test_medical_knowledge_lifecycle(environment, client, monkeypatch):
         retry = client.put(f"{path}/version", headers=csrf, **multipart(second, new_original))
         assert retry.json() == replaced.json()
         assert len(transport.objects) == 2
+        assert client.get(original_path).status_code == 404
         version = replaced.json()["current_version"]
-        assert status(client, "verified", **{
-            **review,
-            "review_revision": version["review_revision"],
+        new_review = {
+            "version_id": version["id"], "review_revision": version["review_revision"],
             "verified_sha256": version["sha256"],
-        }).status_code == 200
-        assert index_current(client).status_code == 200
-        assert status(client, "published").status_code == 200
+        }
+        publish_path = f"{path}/review-publish"
+        assert client.post(publish_path, json=new_review).status_code == 403
+        assert reader.post(
+            publish_path, headers=rag_integration.headers(reader), json=new_review,
+        ).status_code == 403
+        assert client.post(
+            publish_path, headers=csrf, json={**new_review, "verified_sha256": "0" * 64},
+        ).status_code == 422
+        with monkeypatch.context() as interrupted:
+            interrupted.setattr(KnowledgeVectors, "write_batch", interrupted_write)
+            assert client.post(publish_path, headers=csrf, json=new_review).status_code == 503
+        with Session(engine) as db:
+            saved = db.get(MedicalVersion, UUID(version["id"]))
+            assert saved.status == "verified"
+            assert saved.reviewed_by == admin_id
+            assert saved.generation is None
+        assert results(reader) == []
+        published = client.post(publish_path, headers=csrf, json=new_review)
+        assert published.status_code == 200, published.text
+        assert published.json()["current_version"]["status"] == "published"
+        assert client.post(publish_path, headers=csrf, json=new_review).json() == published.json()
         new_hits = results(reader, f"Synthetic new guideline llama{identity[:12]}.")
         assert [item["source"]["version_id"] for item in new_hits] == [version["id"]]
+        assert status(client, "outdated").status_code == 200
+        assert client.post(publish_path, headers=csrf, json=new_review).status_code == 409
         assert status(client, "rejected").status_code == 200
         assert results(reader) == []
     with Session(engine) as db:
