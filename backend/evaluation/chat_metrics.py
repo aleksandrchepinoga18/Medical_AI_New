@@ -101,21 +101,37 @@ def summarize(rows: list[dict[str, Any]], *, live: bool = False) -> dict[str, An
     retrieval = [row["retrieval"] for row in rows if row.get("retrieval")]
     hidden_queries = [row["retrieval_quality"] for row in rows if "retrieval_quality" in row]
     answers = [row["answer"] for row in ordinary]
+    completed = [
+        row for row in ordinary
+        if row["answer"]["status"] not in {"no_answer", "technical_error"}
+    ]
+    quality = [row["answer"] for row in completed]
+    timeouts = {"timeout", "gigachat_timeout"}
+    llm_errors = Counter(
+        request["error"] for row in ordinary for request in row.get("llm_requests", [])
+        if request["error"]
+    )
+    timed_out = sum(
+        row["error"] in timeouts or row["fallback"] in timeouts
+        or any(request["error"] in timeouts for request in row.get("llm_requests", []))
+        for row in ordinary
+    )
     tools = [tool for row in ordinary for tool in row["tools"]]
     critical = [passed for row in rows for passed in row["checks"].values()]
+    tool_errors = Counter(tool["error"] for tool in tools if tool["error"])
     error_counts = Counter(row["error"] for row in rows if row["error"])
-    error_counts.update(tool["error"] for tool in tools if tool["error"])
+    error_counts.update(tool_errors)
     error_counts.update(row["error"] for row in retrieval if row["error"])
     repetitions = [row["wall_ms"] for row in ordinary]
     timing = [tool["ms"] for tool in tools]
 
     def micro(kind: str) -> float | None:
-        return ratio(sum(ans[f"{kind}_hits"] for ans in answers),
-                     sum(ans[f"{kind}_total"] for ans in answers))
+        return ratio(sum(ans[f"{kind}_hits"] for ans in quality),
+                     sum(ans[f"{kind}_total"] for ans in quality))
 
     scores = [row["scores"] for row in retrieval if row.get("scores")]
     return {
-        "scenarios": len(rows), "answer_scenarios": len(ordinary),
+        "scenarios": len(rows), "answer_scenarios": len(quality),
         "retrieval": {
             "queries": len(retrieval), "scored": len(scores),
             "hidden_source_queries": len(hidden_queries),
@@ -129,6 +145,7 @@ def summarize(rows: list[dict[str, Any]], *, live: bool = False) -> dict[str, An
             "routing_accuracy": ratio(sum(row["routing_ok"] for row in ordinary), len(ordinary)),
             "tool_success": ratio(sum(not tool["error"] for tool in tools), len(tools)),
             "tool_calls": len(tools),
+            "tool_errors": dict(tool_errors),
             "calls_per_question": ratio(len(tools), len(ordinary)),
             "unrequested_pubmed_rate": ratio(sum(row["extra_pubmed"] for row in ordinary),
                                             len(ordinary)),
@@ -140,19 +157,31 @@ def summarize(rows: list[dict[str, Any]], *, live: bool = False) -> dict[str, An
             "context_errors": sum(row["context_error"] for row in ordinary),
         },
         "answers": {
-            "statuses": dict(Counter(answer["status"] for answer in answers)),
+            "statuses": dict(Counter(answer["status"] for answer in quality)),
             "facts": micro("fact"), "numerical": micro("numeric"),
             "required_sources": micro("required_source"),
             "citation_validity": ratio(
-                sum(ans["citations_valid"] for ans in answers), len(answers),
+                sum(ans["citations_valid"] for ans in quality), len(quality),
             ),
-            "extra_warning_rate": ratio(sum(ans["extra_warning"] for ans in answers), len(answers)),
+            "extra_warning_rate": ratio(
+                sum(ans["extra_warning"] for ans in quality), len(quality),
+            ),
+        },
+        "reliability": {
+            "scenarios_attempted": len(ordinary),
+            "outcomes": dict(Counter(answer["status"] for answer in answers)),
+            "completed_answers": len(quality),
+            "fallback_answers": sum(bool(row["fallback"]) for row in completed),
+            "timeout_scenarios": timed_out,
+            "llm_request_errors": dict(llm_errors),
             "technical_error_rate": ratio(
                 sum(ans["status"] == "technical_error" for ans in answers), len(answers),
             ),
         },
         "security": {
-            "checks": len(critical), "passed": sum(critical), "failed": critical.count(False),
+            "checks": len(critical), "passed": critical.count(True),
+            "failed": critical.count(False),
+            "unverified": critical.count(None),
         },
         "performance": {
             "wall_mean_ms": mean(repetitions) if repetitions else None,
@@ -174,6 +203,7 @@ def compare_reports(current: dict[str, Any], previous: dict[str, Any]) -> dict[s
         and current.get("commit") == previous.get("commit")
         and current.get("retrieval_backend") == previous.get("retrieval_backend")
         and current.get("retrieval_config") == previous.get("retrieval_config")
+        and current.get("selected_cases") == previous.get("selected_cases")
         and current.get("complete") and previous.get("complete")
     )
     if not compatible:

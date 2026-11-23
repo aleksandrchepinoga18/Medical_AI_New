@@ -1,4 +1,5 @@
 from argparse import Namespace
+from asyncio import run
 from contextlib import nullcontext
 from os import environ
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.llm.gateway import GatewayError, ToolCall
 from app.rag.adapters import JsonHttp
 from evaluation import chat_runtime
 from evaluation.chat_fixtures import Corpus, seed_knowledge
@@ -20,6 +22,7 @@ from evaluation.chat_metrics import (
     normalized_answer,
     retrieval_scores,
     score_answer,
+    summarize,
 )
 from evaluation.chat_runtime import evaluate
 from evaluation.extraction_tracking import register
@@ -125,10 +128,94 @@ def test_dry_run_does_not_invoke_evaluation_or_mlflow(monkeypatch):
     monkeypatch.setattr(evaluate_chat, "register", unexpected)
     result = evaluate_chat.safe_report(Namespace(
         dry_run=True, provider="ollama", mode="offline", retrieval="fixed",
-        commit="6a1953f", mlflow_uri="http://localhost:5000",
+        commit="6a1953f", mlflow_uri="http://localhost:5000", case=["cbc-reference"],
     ))
     assert result["state"] == "configuration_checked"
+    assert result["scenarios_expected"] == 1 and result["selected_cases"] == ["cbc-reference"]
     assert "summary" not in result and "cases" not in result
+
+
+def test_evaluation_reports_llm_phase_and_safe_errors(capsys):
+    async def failing_final(_messages):
+        yield "SYNTHETIC-PRIVATE"
+        raise GatewayError("timeout")
+
+    async def scenario():
+        trace = chat_runtime.Trace()
+        trace.round = 2
+        model = SimpleNamespace(stream=failing_final)
+        provider = chat_runtime.ObservedProvider(model, trace, fallback=False)
+        with pytest.raises(GatewayError, match="timeout"):
+            async for _ in provider.stream([{"role": "user", "content": "PRIVATE-CONTENT"}]):
+                pass
+        return trace.llm_requests[0]
+
+    request = run(scenario())
+    assert request["phase"] == "grounded_answer" and request["round"] == 2
+    assert request["error"] == "timeout" and request["received_text"]
+    assert request["timeout_origin"] == "provider_request"
+    assert request["context_bytes"] > 0 and request["ms"] >= request["first_event_ms"]
+    assert "PRIVATE" not in repr(request)
+    issues = chat_runtime.argument_issues(ToolCall("get_documents", {
+        "documents": ["PRIVATE-VALUE"], "PRIVATE-FIELD": "sensitive",
+    }))
+    assert issues == [
+        {"field": "documents", "type": "int_type"}, {"field": "other", "type": "extra_forbidden"},
+    ]
+    evaluate_chat.print_progress(7, 30, {
+        "id": "cbc-reference", "error": "timeout", "wall_ms": 180000, "checks": {},
+    })
+    assert capsys.readouterr().out == "[7/30] cbc-reference status=timeout duration=180.00s\n"
+
+
+def test_summary_counts_timeouts_outside_answer_quality():
+    case = {"facts": ["HbA1c"], "required_sources": []}
+    row = {
+        "llm_backend": "live", "llm_calls": 1, "llm_ms": 5, "wall_ms": 6, "checks": {},
+        "tools": [], "routing_ok": True, "mixed": False, "extra_pubmed": False,
+        "context_error": False, "fallback": None,
+    }
+    summary = summarize([
+        {**row, "error": None, "answer": score_answer(case, "HbA1c", [], set(), None)},
+        {
+            **row, "error": "timeout", "routing_ok": False,
+            "llm_requests": [{"error": "timeout"}],
+            "answer": score_answer(case, "", [], set(), "timeout"),
+        },
+    ], live=True)
+    assert summary["answer_scenarios"] == 1 and summary["answers"]["facts"] == 1
+    assert summary["reliability"]["timeout_scenarios"] == 1
+    assert summary["reliability"]["outcomes"] == {"correct": 1, "technical_error": 1}
+    assert summary["errors"] == {"timeout": 1}
+    assert summary["agent"]["routing_accuracy"] == 0.5
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("leaks", [False, True])
+def test_history_probe_rechecks_stored_source_without_model_citations(monkeypatch, leaks):
+    if environ.get("RUN_RAG_INTEGRATION") != "1":
+        pytest.skip("Use the isolated RAG test database")
+    dataset, _ = evaluate_chat.load_dataset()
+    dataset["cases"] = [row for row in dataset["cases"] if row["id"] == "history-recheck"]
+    dataset["documents"] = []
+    dataset["corpus"] = [item for item in dataset["corpus"] if item["id"] == "a1c"]
+
+    async def no_tool_reply(_messages, _tools):
+        yield "HbA1c."
+
+    monkeypatch.setattr(
+        chat_runtime, "gateway", lambda *_args, **_kw: SimpleNamespace(tool_stream=no_tool_reply),
+    )
+    if leaks:
+        def allow_stale_source(_db, _config, sources, **_kwargs):
+            return {chat_runtime.medical_sources.public_citation_key(source) for source in sources}
+
+        monkeypatch.setattr(chat_runtime.routes, "verified_public", allow_stale_source)
+    (row,) = evaluate(dataset, "ollama", live=True, live_retrieval=False)
+    assert row["tools"] == [] and row["sources"] == []
+    assert row["answer"]["status"] == "partial" and row["error"] is None
+    assert row["history_probe"] == ("source_still_visible" if leaks else "passed")
+    assert row["checks"] == {"history_recheck": not leaks}
 
 
 def test_offline_qdrant_accepts_only_the_synthetic_stand_and_bge_m3(monkeypatch):

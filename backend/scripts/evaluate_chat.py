@@ -65,7 +65,7 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerow([
             "scenario", "llm_backend", "answer_status", "routing_ok", "citations_valid",
             "numeric_hits", "numeric_total", "llm_calls", "tool_calls", "wall_ms",
-            "fallback", "error", "failed_critical_checks",
+            "fallback", "error", "failed_critical_checks", "unverified_critical_checks",
         ])
         for row in rows:
             answer = row["answer"]
@@ -74,12 +74,27 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
                 answer["citations_valid"], answer["numeric_hits"], answer["numeric_total"],
                 row["llm_calls"], len(row["tools"]), round(row["wall_ms"], 2),
                 row["fallback"], row["error"],
-                ",".join(check for check, passed in row["checks"].items() if not passed),
+                ",".join(check for check, passed in row["checks"].items() if passed is False),
+                ",".join(check for check, passed in row["checks"].items() if passed is None),
             ])
+
+
+def print_progress(index: int, total: int, row: dict[str, Any]) -> None:
+    status = row["error"] or row["answer"]["status"]
+    if row["checks"].get("consent_denied"):
+        status = "consent_denied"
+    print(f"[{index}/{total}] {row['id']} status={status} duration={row['wall_ms'] / 1000:.2f}s",
+          flush=True)
 
 
 def safe_report(args: argparse.Namespace) -> dict[str, Any]:
     dataset, dataset_hash = load_dataset()
+    selected = set(getattr(args, "case", []) or [])
+    if not selected <= {case["id"] for case in dataset["cases"]}:
+        raise ValueError("unknown_evaluation_case")
+    if selected:
+        cases = [case for case in dataset["cases"] if case["id"] in selected]
+        dataset = {**dataset, "cases": cases}
     if args.mlflow_uri:
         local_tracking_url(args.mlflow_uri, allow_docker_host=True)
     live = args.mode == "live"
@@ -90,6 +105,7 @@ def safe_report(args: argparse.Namespace) -> dict[str, Any]:
         "commit": args.commit, "mode": args.mode, "provider": args.provider,
         "model": settings.generation_model, "retrieval_backend": args.retrieval,
         "pubmed_backend": "fixed", "scenarios_expected": len(dataset["cases"]),
+        "selected_cases": [case["id"] for case in dataset["cases"]] if selected else None,
         "retrieval_config": {
             "embedding_model": settings.rag_embedding_model if live_retrieval else "fixed",
             "embedding_digest": settings.rag_embedding_digest if live_retrieval else "fixed",
@@ -107,7 +123,7 @@ def safe_report(args: argparse.Namespace) -> dict[str, Any]:
     previous = json.loads(args.compare.read_text(encoding="utf-8")) if args.compare else None
     rows = evaluate(
         dataset, args.provider, live=live, live_retrieval=live_retrieval,
-        allow_synthetic_cloud=args.allow_synthetic_cloud,
+        allow_synthetic_cloud=args.allow_synthetic_cloud, on_case=print_progress,
     )
     summary = summarize(rows, live=live)
     complete = len(rows) == len(dataset["cases"])
@@ -116,6 +132,10 @@ def safe_report(args: argparse.Namespace) -> dict[str, Any]:
         recommendations.append("Check the selected provider credentials or connectivity.")
     if summary["security"]["failed"]:
         recommendations.append("Investigate failed critical checks before interpreting quality.")
+    if summary["security"]["unverified"]:
+        recommendations.append("Inspect the setup of unverified security probes.")
+    if summary["reliability"]["timeout_scenarios"]:
+        recommendations.append("Inspect LLM request phases and answer coverage before comparison.")
     if summary["agent"]["context_errors"]:
         recommendations.append("Inspect the tool result budget for the affected scenarios.")
     if not summary["retrieval"]["scored"]:
@@ -154,7 +174,7 @@ def print_summary(report: dict[str, Any]) -> None:
     print(f"{report['mode']} / {report['provider']} / {report['model']}")
     print(f"Scenarios {summary['scenarios']} / {report['scenarios_expected']}")
     print("| Group | Metric | Value |\n|---|---|---|")
-    for group in ("retrieval", "agent", "answers", "security", "performance"):
+    for group in ("retrieval", "agent", "answers", "reliability", "security", "performance"):
         for metric, value in summary[group].items():
             display = f"{value:.4g}" if type(value) is float else value
             print(f"| {group} | {metric} | {display} |")
@@ -181,6 +201,7 @@ def main() -> int:
     parser.add_argument("--mode", choices=["offline", "live"], default="offline")
     parser.add_argument("--provider", choices=["ollama", "gigachat"], required=True)
     parser.add_argument("--retrieval", choices=["fixed", "qdrant"], default="fixed")
+    parser.add_argument("--case", action="append", help="Evaluate a scenario by ID (repeatable)")
     parser.add_argument("--allow-synthetic-cloud", action="store_true")
     parser.add_argument("--commit", required=True, help="Git revision supplied by the operator")
     parser.add_argument("--output", type=Path, help="Local JSON report")
@@ -216,11 +237,13 @@ def main() -> int:
             "isolated_rag_test_environment_required", "offline_qdrant_requires_bge_m3",
             "selected_provider_unavailable", "invalid_dataset_cases", "invalid_dataset_sources",
             "invalid_dataset_relevance", "invalid_mlflow_uri", "synthetic_cloud_consent_required",
+            "invalid_dataset_hidden_source", "unknown_evaluation_case",
         }
         print(f"Evaluation blocked: {code if code in known else type(exc).__name__}")
         return 2
     return int(
         not report["complete"] or report["summary"]["security"]["failed"] > 0
+        or report["summary"]["security"]["unverified"] > 0
         or report["mlflow"]["status"] == "failed"
     )
 
