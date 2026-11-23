@@ -1,6 +1,7 @@
 """Optional aggregate metrics in the existing local MLflow tracking service."""
 
 from time import time
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -18,26 +19,37 @@ def numeric_metrics(summary: dict[str, object], prefix: str = "") -> dict[str, i
     return metrics
 
 
-def register(
-    tracking_uri: str, summaries: dict[str, dict[str, object]], params: dict[str, str],
-) -> str:
+def local_tracking_url(tracking_uri: str, *, allow_docker_host: bool = False) -> httpx.URL:
     url = httpx.URL(tracking_uri)
+    allowed_host = url.host in {"localhost", "127.0.0.1", "::1"} or (
+        allow_docker_host and url.host == "host.docker.internal" and url.port == 5000
+    )
     if (
-        url.scheme not in {"http", "https"}
-        or url.host not in {"localhost", "127.0.0.1", "::1"}
+        url.scheme not in {"http", "https"} or not allowed_host
         or url.userinfo or url.path != "/" or url.query or url.fragment
     ):
         raise ValueError("invalid_mlflow_uri")
+    return url
+
+
+def register(
+    tracking_uri: str, summaries: dict[str, dict[str, object]], params: dict[str, str],
+    *, experiment_name: str = EXPERIMENT, run_name: str = "synthetic PDFs",
+    artifact_json: bytes | None = None, allow_docker_host: bool = False,
+) -> str:
+    url = local_tracking_url(tracking_uri, allow_docker_host=allow_docker_host)
     with httpx.Client(
         base_url=str(url).rstrip("/") + "/api/2.0/mlflow/",
         timeout=10, trust_env=False, follow_redirects=False,
     ) as client:
         def experiment() -> httpx.Response:
-            return client.get("experiments/get-by-name", params={"experiment_name": EXPERIMENT})
+            return client.get(
+                "experiments/get-by-name", params={"experiment_name": experiment_name},
+            )
 
         lookup = experiment()
         if lookup.status_code == 404:
-            created = client.post("experiments/create", json={"name": EXPERIMENT})
+            created = client.post("experiments/create", json={"name": experiment_name})
             if created.status_code in (400, 409) and (
                 created.json().get("error_code") == "RESOURCE_ALREADY_EXISTS"
             ):
@@ -53,10 +65,11 @@ def register(
         now = int(time() * 1000)
         response = client.post(
             "runs/create",
-            json={"experiment_id": experiment_id, "run_name": "synthetic PDFs", "start_time": now},
+            json={"experiment_id": experiment_id, "run_name": run_name, "start_time": now},
         )
         response.raise_for_status()
-        run_id: str = response.json()["run"]["info"]["run_id"]
+        info = response.json()["run"]["info"]
+        run_id: str = info["run_id"]
         metrics = [
             {"key": f"{method}.{key}", "value": value, "timestamp": now, "step": 0}
             for method, summary in summaries.items()
@@ -73,6 +86,17 @@ def register(
                 },
             )
             logged.raise_for_status()
+            if artifact_json is not None:
+                root = urlsplit(info["artifact_uri"])
+                if root.scheme != "mlflow-artifacts" or root.netloc or ".." in root.path.split("/"):
+                    raise ValueError("mlflow_artifact_proxy_required")
+                path = quote(root.path.strip("/"), safe="/")
+                artifact_url = url.copy_with(
+                    path=f"/api/2.0/mlflow-artifacts/artifacts/{path}/evaluation.json",
+                )
+                client.put(artifact_url, content=artifact_json, headers={
+                    "Content-Type": "application/json",
+                }).raise_for_status()
             status = "FINISHED"
         finally:
             client.post(
