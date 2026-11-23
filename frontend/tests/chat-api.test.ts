@@ -57,3 +57,13 @@ it.each([
   await expect(chatRequest("/synthetic/messages", "POST", { content: "synthetic" }))
     .rejects.toMatchObject({ status: 403, message: expect.stringContaining(explanation) });
 });
+
+it("explains provider configuration and streaming outages", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(Response.json({
+    detail: { code: "gigachat_not_configured" },
+  }, { status: 503 })));
+  await expect(chatRequest("/synthetic"))
+    .rejects.toMatchObject({ status: 503, message: "GigaChat не настроен на сервере." });
+  const response = new Response('{"type":"error","code":"gigachat_unavailable"}\n');
+  await expect(readChatStream(response, () => {})).rejects.toThrow("GigaChat недоступен");
+});

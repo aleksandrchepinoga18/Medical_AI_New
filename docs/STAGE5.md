@@ -88,8 +88,9 @@ GigaChat использует SSE на `/v1/chat/completions` и сохраня�
 проверяет согласие до обращения к провайдеру. Согласие на извлечение PDF здесь
 не действует. Агент передаёт выдержки и измерения из инструментов, а оригинал PDF
 остаётся в хранилище. Источники проверяются перед сохранением ответа. При
-техническом сбое ответ формируется локально. Фильтрация GigaChat завершает
-запрос с кодом `gigachat_filtered`.
+явном выборе GigaChat технический сбой показывается в чате. Старые API-запросы
+без выбора провайдера сохраняют режим с помеченным локальным резервным
+ответом. Фильтрация GigaChat завершает запрос с кодом `gigachat_filtered`.
 
 В настройках облака окно приложения по умолчанию составляет 16 384 токена,
 лимит ответа — 2 048 токенов, дедлайн — 180 секунд. Эти параметры и бюджеты
@@ -105,7 +106,7 @@ GigaChat использует SSE на `/v1/chat/completions` и сохраня�
 `CHAT_GIGACHAT_HISTORY_CHARS` и `CHAT_GIGACHAT_CONTEXT_CHARS`.
 Для Ultra используется действующая авторизация `GIGACHAT_API_PERS`.
 
-### Переключение без пересборки
+### Настройка выбора провайдера без пересборки
 
 В Git Bash из корня проекта используйте набор Compose-файлов текущего dev-стека.
 Пример для стандартного стека с локальным RAG и готовыми образами:
@@ -124,8 +125,8 @@ read -rsp 'Ключ авторизации GigaChat: ' GIGACHAT_CREDENTIALS; pri
 export GIGACHAT_CREDENTIALS
 # Если дополнительно нужен PEM, задайте имя уже установленного сертификата.
 # export GIGACHAT_CA_BUNDLE=/run/gigachat-ca/russian_trusted_root_ca_pem.crt
-LLM_PROVIDER=gigachat gc config --quiet &&
-LLM_PROVIDER=gigachat gc up -d --no-deps --no-build --pull never --force-recreate --wait backend
+LLM_PROVIDER=ollama gc config --quiet &&
+LLM_PROVIDER=ollama gc up -d --no-deps --no-build --pull never --force-recreate --wait backend
 ```
 
 При первом применении изменений чата пересоздайте также dev-frontend. Команда
@@ -136,25 +137,18 @@ Frontend из старого runtime-образа содержит интерф�
 gc up -d --no-deps --no-build --pull never --force-recreate --wait frontend
 ```
 
-Если backend уже работает в GigaChat с dev bind mounts, сохраните его
-окружение и дождитесь автоперезагрузки либо выполните `gc restart backend`.
-Обновите вкладку чата и откройте диалог. Интерфейс читает
-`llm_provider` и `llm_model` из `GET /api/chat/{id}`.
+Если GigaChat уже настроен в backend с dev bind mounts, достаточно обновить
+вкладку и открыть диалог. `LLM_PROVIDER` задаёт модель по умолчанию.
+Чат читает названия и статусы из `GET /api/chat/{id}` и отправляет поле
+`llm_provider` с каждым сообщением. Для следующих переключений служит поле
+**Провайдер модели** в чате.
 
-Проверьте два режима на синтетическом сообщении. В GigaChat отображается
-`GigaChat-3-Ultra`, а отправка требует отметки о согласии. После отметки запрос
-содержит `external_consent: "gigachat"`. При переключении с Ollama в открытой
-вкладке запрос без согласия получает `403 external_consent_required`.
-Чат отображает причину, загружает новое имя модели и сохраняет черновик.
-В Ollama отображается `Ollama / qwen2.5:7b-instruct` при стандартной модели,
-сообщение отправляется без облачного согласия.
-
-Вернуться на Ollama можно командой:
-
-```bash
-LLM_PROVIDER=ollama dc up -d --no-deps --no-build --pull never --force-recreate --wait backend
-unset GIGACHAT_CREDENTIALS GIGACHAT_CA_BUNDLE
-```
+При пустом ключе GigaChat помечен как **Не настроен**, при ошибке локальной
+настройки TLS — **Недоступен**. Сеть и авторизация проверяются при отправке.
+Проверьте переключение на синтетических сообщениях. Ollama отвечает без
+облачного согласия. GigaChat требует новой отметки для каждого сообщения.
+Запрос в GigaChat без `external_consent: "gigachat"` получает
+`403 external_consent_required`.
 
 ### Синтетическая проверка Function Calling
 

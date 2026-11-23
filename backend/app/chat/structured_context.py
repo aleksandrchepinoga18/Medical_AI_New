@@ -228,7 +228,17 @@ def comparison(
     return lines
 
 
-def trend(records: list[Record], *, partial: bool) -> list[str]:
+def compact_point(record: Record, when: date) -> str:
+    row = record.row
+    value = f"{row.value} {row.unit}" if row.unit else row.value
+    reference = [f"реф. {row.reference}"] if row.reference else []
+    if position := deviation(row):
+        reference.append(position)
+    details = f" ({', '.join(reference)})" if reference else ""
+    return f"• {when} · №{record.document_number}: {value}{details}"
+
+
+def trend(records: list[Record], *, partial: bool, compact: bool = False) -> list[str]:
     dated: dict[date, list[Record]] = defaultdict(list)
     for record in records:
         when = observed_date(record.row.date)
@@ -240,23 +250,34 @@ def trend(records: list[Record], *, partial: bool) -> list[str]:
             result.append(f"• {when}: несколько измерений, однозначная точка отсутствует.")
             continue
         item = items[0]
-        result.append(f"• {when} · документ № {item.document_number} · {show(item.row)}")
+        if compact:
+            result.append(compact_point(item, when))
+        else:
+            result.append(f"• {when} · документ № {item.document_number} · {show(item.row)}")
     if len(dated) < 2:
-        result.append("Недостаточно измерений для расчёта динамики.")
+        result.append(
+            "Недостаточно измерений." if compact
+            else "Недостаточно измерений для расчёта динамики."
+        )
     if not partial and len(dated) >= 2 and all(len(items) == 1 for items in dated.values()):
         first, last = dated[min(dated)][0], dated[max(dated)][0]
         a, b = scalar(first.row.value), scalar(last.row.value)
         units = {items[0].unit for items in dated.values()}
         if len(units) == 1 and None not in units and a and b and not a[0] and not b[0]:
             difference = b[1] - a[1]
-            result.append(
-                f"Изменение между первой и последней датой: {difference:+f} {first.row.unit}."
-            )
-            if a[1] != 0:
-                percent = difference / a[1] * 100
-                result.append(f"Процентное изменение: {percent:+.2f}%.")
+            percent = difference / a[1] * 100 if a[1] != 0 else None
+            if compact and percent is not None:
+                result.append(
+                    f"Между крайними датами: {difference:+f} {first.row.unit} ({percent:+.2f}%)."
+                )
             else:
-                result.append("Процентное изменение не определено при исходном значении 0.")
+                result.append(
+                    f"Изменение между первой и последней датой: {difference:+f} {first.row.unit}."
+                )
+                result.append(
+                    f"Процентное изменение: {percent:+.2f}%." if percent is not None
+                    else "Процентное изменение не определено при исходном значении 0."
+                )
     return result
 
 
@@ -264,6 +285,7 @@ def structured_context(
     extractions: list[Extraction], mode: Mode, question: str, budget: int,
     *, targets: set[str] | None = None, earlier_questions: Sequence[str] = (),
     indicators: Sequence[str] = (), confirmed_only: bool = False,
+    compact_trend: bool = False,
 ) -> OverviewContext | None:
     if not any(item.version.structured_result is not None for item in extractions):
         return None
@@ -379,7 +401,8 @@ def structured_context(
             series[analyte(record.row.name)].append(record)
         for key, label in labels.items():
             if points := series.get(key):
-                groups.append("\n".join([points[0].row.name, *trend(points, partial=partial)]))
+                lines = trend(points, partial=partial, compact=compact_trend)
+                groups.append("\n".join([points[0].row.name, *lines]))
             else:
                 groups.append(f"{label}: подтверждённых измерений с датой нет в ответе.")
     if partial:

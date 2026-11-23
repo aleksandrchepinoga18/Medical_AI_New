@@ -14,6 +14,10 @@ vi.mock("../lib/chat-api", async (importOriginal) => ({
 }));
 const localModel = { llm_provider: "ollama", llm_model: "qwen2.5:7b-instruct" };
 const cloudModel = { llm_provider: "gigachat", llm_model: "GigaChat-3-Ultra" };
+const availableProviders = {
+  ollama: { model: localModel.llm_model, status: "ready" },
+  gigachat: { model: cloudModel.llm_model, status: "ready" },
+};
 afterEach(() => { cleanup(); vi.resetAllMocks(); });
 it("opens saved history and keeps a failed message for retry", async () => {
   mocks.request.mockImplementation(async (path: string, method = "GET") => {
@@ -41,6 +45,42 @@ it("opens saved history and keeps a failed message for retry", async () => {
   );
   expect(await screen.findByRole("alert")).toHaveTextContent("недоступен");
   expect(screen.getByLabelText("Сообщение")).toHaveValue("synthetic question");
+});
+
+it("identifies public sources alongside personal citations", async () => {
+  const pubmedUrl = "https://pubmed.ncbi.nlm.nih.gov/12345678/";
+  mocks.request.mockImplementation(async (path: string) => Response.json(path ? {
+    ...localModel,
+    messages: [{
+      id: "mixed", role: "assistant", status: "complete", content: "[S1] [S2] [S3]",
+      sources: [
+        {
+          source_id: "S1", document_id: "synthetic-doc", document_number: 2,
+          source_url: "/documents/synthetic-doc", filename: "results.pdf", sources: [],
+        },
+        {
+          source_id: "S2", kind: "medical_knowledge", knowledge_source_id: "ref",
+          chunk_id: "fragment", version_id: "version", version: "1",
+          start_char: 0, end_char: 12, source_url: "https://example.org/reference/",
+          filename: "Synthetic reference", sources: [{ kind: "page", index: 2 }],
+        },
+        {
+          source_id: "S3", kind: "pubmed", pmid: "12345678", doi: null, journal: null,
+          year: 2024, authors: [], source_url: pubmedUrl,
+          filename: "Synthetic article", sources: [],
+        },
+      ],
+    }],
+  } : [{ id: "one", title: "Saved" }]));
+  render(<PersonalChat />);
+  await userEvent.setup().click(await screen.findByRole("button", { name: "Saved" }));
+  expect(await screen.findByRole("link", { name: "[S1] № 2 · results.pdf" }))
+    .toHaveAttribute("href", "/documents/synthetic-doc");
+  expect(screen.getByRole("link", { name: "[S2] Медицинская база · Synthetic reference" }))
+    .toHaveAttribute("href", "https://example.org/reference/");
+  expect(screen.getByRole("link", { name: "[S3] PubMed · Synthetic article" }))
+    .toHaveAttribute("href", pubmedUrl);
+  expect(screen.getByText(/PMID 12345678/)).toBeInTheDocument();
 });
 
 it("keeps streaming through state and router updates until Stop is clicked", async () => {
@@ -103,6 +143,72 @@ it("requires fresh cloud consent for each message", async () => {
   expect(consent).not.toBeChecked();
   await user.type(screen.getByLabelText("Сообщение"), "Another");
   expect(submit).toBeDisabled();
+});
+
+it("selects either provider per send and clears consent on provider change", async () => {
+  mocks.request.mockImplementation(async (path: string, method = "GET") => {
+    if (method === "POST") return new Response("");
+    return Response.json(path ? {
+      ...localModel, llm_providers: availableProviders, messages: [],
+    } : [{ id: "one", title: "Saved" }]);
+  });
+  mocks.stream.mockResolvedValue(undefined);
+  render(<PersonalChat />);
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole("button", { name: "Saved" }));
+  const selector = screen.getByRole("combobox", { name: "Провайдер модели" });
+  const submit = screen.getByRole("button", { name: "Отправить" });
+  const input = screen.getByLabelText("Сообщение");
+  await user.type(input, "Synthetic cloud");
+  expect(selector).toHaveValue("ollama");
+  await user.selectOptions(selector, "gigachat");
+  expect(submit).toBeDisabled();
+  expect(mocks.request.mock.calls.some(call => call[1] === "POST")).toBe(false);
+  await user.click(screen.getByRole("checkbox"));
+  await user.selectOptions(selector, "ollama");
+  await user.selectOptions(selector, "gigachat");
+  expect(screen.getByRole("checkbox")).not.toBeChecked();
+  expect(submit).toBeDisabled();
+  await user.click(screen.getByRole("checkbox"));
+  await user.click(submit);
+  await waitFor(() => expect(mocks.request).toHaveBeenCalledWith(
+    "/one/messages", "POST",
+    { content: "Synthetic cloud", llm_provider: "gigachat", external_consent: "gigachat" },
+    expect.anything(),
+  ));
+  await waitFor(() => expect(selector).toBeEnabled());
+  expect(selector).toHaveValue("gigachat");
+  expect(screen.getByRole("checkbox")).not.toBeChecked();
+  await user.selectOptions(selector, "ollama");
+  await user.type(input, "Synthetic local");
+  await user.click(submit);
+  await waitFor(() => expect(mocks.request).toHaveBeenCalledWith(
+    "/one/messages", "POST", { content: "Synthetic local", llm_provider: "ollama" }, expect.anything(),
+  ));
+});
+
+it.each([
+  ["not_configured", "Не настроен"],
+  ["unavailable", "Недоступен"],
+])("shows disabled GigaChat with status %s", async (status, label) => {
+  mocks.request.mockImplementation(async (path: string) => Response.json(path ? {
+    ...cloudModel,
+    llm_providers: {
+      ...availableProviders, gigachat: { model: cloudModel.llm_model, status },
+    },
+    messages: [],
+  } : [{ id: "one", title: "Saved" }]));
+  render(<PersonalChat />);
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole("button", { name: "Saved" }));
+  await user.type(screen.getByLabelText("Сообщение"), "Synthetic");
+  expect(screen.getByRole("option", { name: `GigaChat-3-Ultra — ${label}` })).toBeDisabled();
+  expect(screen.getByText(`GigaChat — ${label} на сервере.`)).toBeInTheDocument();
+  const selector = screen.getByRole("combobox", { name: "Провайдер модели" });
+  expect(selector).toHaveValue("gigachat");
+  expect(screen.getByRole("button", { name: "Отправить" })).toBeDisabled();
+  await user.selectOptions(selector, "ollama");
+  expect(screen.getByRole("button", { name: "Отправить" })).toBeEnabled();
 });
 
 it("loads the cloud model after a rejected send from a tab opened on Ollama", async () => {

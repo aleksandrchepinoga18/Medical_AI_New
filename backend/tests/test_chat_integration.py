@@ -10,6 +10,7 @@ import httpx
 import pytest
 from alembic.config import Config
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -20,6 +21,9 @@ from app.chat import agent, routes
 from app.chat.models import Conversation, Message
 from app.db import database_url, get_db, get_settings
 from app.documents.models import Document, DocumentTextVersion
+from app.knowledge import service as knowledge_service
+from app.knowledge.models import MedicalChunk, MedicalSource, MedicalVersion
+from app.knowledge.vectors import KNOWLEDGE_PIPELINE, KnowledgeVectors
 from app.llm.gateway import Gateway, GatewayError, Ollama, ToolCall
 from app.main import app
 from app.rag.adapters import OllamaEmbeddings, QdrantVectors, RagError, fingerprint
@@ -110,6 +114,164 @@ def test_persistence_crud_and_isolation(setup):
     app.dependency_overrides[current_user] = lambda: users[0]
     assert client.delete(f"/chat/{cid}").status_code == 204
     assert client.get(f"/chat/{cid}").status_code == 404
+
+
+@pytest.mark.parametrize("large", [False, True], ids=["small", "large"])
+def test_chat_cites_only_current_published_knowledge_chunks(setup, monkeypatch, large):
+    client, (owner, _) = setup
+    points = []
+    versions = {}
+    chunks = {}
+    chunk_texts = {}
+    engine = routes.get_engine()
+    settings = get_settings()
+    eligibility = fingerprint(settings)
+    with Session(engine) as db:
+        for status in ("published", "uploaded", "outdated"):
+            source_id, version_id, chunk_id, generation = (uuid4() for _ in range(4))
+            is_large = large and status == "published"
+            count = 3 if is_large else 1
+            title = "Synthetic Hemoglobin A1C (HbA1c) Test" if is_large else f"Synthetic {status}"
+            source = MedicalSource(
+                id=source_id, title=title, url=f"https://example.org/{source_id}/",
+                material_type="Synthetic", author="Synthetic", publisher="Synthetic",
+                specialty="Synthetic", language="en", jurisdiction="Synthetic",
+            )
+            db.add(source)
+            db.flush()
+            version = MedicalVersion(
+                id=version_id, source_id=source_id, version="test-1", is_current=True,
+                status=status, uploaded_by=owner.id, uploaded_at=datetime.now(UTC),
+                reviewed_by=owner.id, reviewed_at=datetime.now(UTC), review_note="Synthetic rights",
+                format="pdf", size_bytes=20, sha256="0" * 64,
+                generation=generation, fingerprint=eligibility, chunk_count=count,
+            )
+            db.add(version)
+            db.flush()
+            versions[status] = version_id
+            chunks[status] = chunk_id
+            offset = 0
+            for ordinal in range(count):
+                identifier = chunk_id if ordinal == 0 else uuid4()
+                locators = []
+                start = offset
+                if is_large:
+                    paragraphs = [
+                        f'Раздел {ordinal + 1}. HbA1c: «данные» {i}.\n' for i in range(1, 40)
+                    ]
+                    text = "".join(paragraphs)
+                    for index, paragraph in enumerate(paragraphs, ordinal * len(paragraphs) + 1):
+                        end = offset + len(paragraph)
+                        locators.append({
+                            "kind": "paragraph", "index": index, "start": offset, "end": end,
+                        })
+                        offset = end
+                else:
+                    text = f"Synthetic fragment {status}"
+                    offset += len(text)
+                    locators = [{"kind": "page", "index": 3, "start": start, "end": offset}]
+                db.add(MedicalChunk(
+                    id=identifier, version_id=version_id, text=text,
+                    start_char=start, end_char=offset, locators=locators,
+                ))
+                chunk_texts[str(identifier)] = (text, start, locators)
+                points.append({
+                    "id": str(uuid5(identifier, str(generation))), "score": 1.0 / (ordinal + 1),
+                    "payload": {
+                        "chunk_id": str(identifier), "source_id": str(source_id),
+                        "version_id": str(version_id), "generation": str(generation),
+                        "fingerprint": eligibility, "pipeline": KNOWLEDGE_PIPELINE,
+                    },
+                })
+        db.commit()
+    # Even if the simulated vector service returns out-of-scope matches, SQL rechecks them.
+    monkeypatch.setattr(knowledge_service.OllamaEmbeddings, "embed", lambda *_: [[0.1]])
+    monkeypatch.setattr(KnowledgeVectors, "query_scoped", lambda *_: points)
+    requests = []
+    excerpts = []
+    query = "HbA1c" if large else "гемоглобин"
+
+    def ollama(request):
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if len(requests) == 1:
+            message = {"tool_calls": [{"function": {
+                "name": "search_medical_knowledge", "arguments": {"query": query},
+            }}]}
+        elif len(requests) == 2:
+            assert json.loads(payload["messages"][-1]["content"]) == {
+                "status": "ok", "matches": 3 if large else 1,
+            }
+            message = {"content": "Справочный ответ"}
+        else:
+            assert "tools" not in payload
+            excerpts.extend(json.loads(payload["messages"][-1]["content"])["public_evidence"])
+            assert 1 <= len(excerpts) < 3
+            article = excerpts[0]
+            assert article["chunk_id"] == str(chunks["published"])
+            if large:
+                first_text, _, first_locators = chunk_texts[article["chunk_id"]]
+                assert len(agent.encode(first_locators).encode()) > settings.generation_tool_chars
+                assert len(agent.encode(excerpts).encode()) - 2 <= settings.generation_tool_chars
+                assert article["partial"] and 0 < len(article["text"]) < len(first_text)
+                assert "sources" not in article
+            else:
+                assert article["text"] == "Synthetic fragment published"
+            message = {"content": "Справочная информация [S1]. Лишняя ссылка [S99]."}
+        return httpx.Response(200, text=json.dumps({"message": message, "done": True}) + "\n")
+
+    monkeypatch.setattr(routes, "agent_gateway", lambda config: Gateway(Ollama(
+        config, httpx.MockTransport(ollama),
+    )))
+    cid = client.post("/chat").json()["id"]
+    question = (
+        "Что показывает гликированный гемоглобин HbA1c?" if large else "Что означает гемоглобин?"
+    )
+    events = send_events(client, cid, question)
+    assert events[-1]["type"] == "done" and "[S1]" in events[1]["text"]
+    assert "[S99]" not in events[1]["text"] and "Не хватило места" not in events[1]["text"]
+    citations = events[-1]["sources"]
+    citation = citations[0]
+    assert citation["kind"] == "medical_knowledge" and "document_id" not in citation
+    assert citation["source_id"] == "S1" and citation["chunk_id"] == str(chunks["published"])
+    assert citation["version_id"] == str(versions["published"]) and citation["version"] == "test-1"
+    assert len(citations) == len(excerpts)
+    for saved, excerpt in zip(citations, excerpts, strict=True):
+        original, start, locators = chunk_texts[saved["chunk_id"]]
+        end = saved["end_char"]
+        assert saved["chunk_id"] == excerpt["chunk_id"]
+        assert saved["source_id"] == excerpt["source_id"]
+        assert saved["start_char"] == start and excerpt["text"] == original[:end - start]
+        assert saved["filename"] == excerpt["filename"]
+        assert saved["source_url"] == excerpt["source_url"]
+        assert saved["sources"] == [
+            loc for loc in locators if loc["start"] < end and loc["end"] > start
+        ]
+    assert client.get(f"/chat/{cid}").json()["messages"][-1]["sources"] == citations
+    with Session(engine) as db:
+        db.get(MedicalVersion, versions["published"]).status = "outdated"
+        db.commit()
+    assert client.get(f"/chat/{cid}").json()["messages"][-1]["sources"] == []
+
+
+def test_chat_history_displays_legacy_pubmed_links_as_plain_urls(setup):
+    client, _ = setup
+    cid = client.post("/chat").json()["id"]
+    pmid = "19671910"
+    url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+    citation = {
+        "kind": "pubmed", "source_id": "S1", "source_url": url,
+        "pmid": pmid, "filename": "Synthetic publication", "sources": [],
+    }
+    original = f"Источник [S1]: [[{url}]({url})]({url})."
+    with Session(routes.get_engine()) as db:
+        db.add(Message(
+            conversation_id=UUID(cid), role="assistant", content=original, sources=[citation],
+        ))
+        db.commit()
+    reply, = client.get(f"/chat/{cid}").json()["messages"]
+    assert reply["content"] == f"Источник [S1]: {url}."
+    assert reply["sources"] == [citation]
 
 
 def test_failed_generation_is_not_completed(setup, monkeypatch):
@@ -297,7 +459,9 @@ def test_gigachat_requires_consent_per_message_and_cloud_failure_falls_back_loca
     assert local["llm_provider"] == "ollama" and local["llm_model"] == get_settings().llm_model
     assert send_events(client, cid, "Реплика для текущего диалога")[-1]["type"] == "done"
     assert send_events(client, other, "Реплика для другого диалога")[-1]["type"] == "done"
-    settings = get_settings().model_copy(update={"llm_provider": "gigachat"})
+    settings = get_settings().model_copy(update={
+        "llm_provider": "gigachat", "gigachat_credentials": SecretStr("synthetic"),
+    })
     monkeypatch.setattr(routes, "get_settings", lambda: settings)
     cloud_calls = []
     local_calls = []
@@ -350,6 +514,87 @@ def test_gigachat_requires_consent_per_message_and_cloud_failure_falls_back_loca
     answer = "".join(event["text"] for event in events if event["type"] == "delta")
     assert answer == "Резервный ответ · локальная обработка\n\nЛокальный ответ"
     assert client.get(f"/chat/{cid}").json()["messages"][-1]["content"] == answer
+
+
+def test_chat_selects_configured_provider_and_checks_consent_per_send(setup, monkeypatch):
+    client, _ = setup
+    settings = get_settings().model_copy(update={
+        "llm_provider": "ollama", "gigachat_credentials": SecretStr(""),
+        "gigachat_ca_bundle": "",
+    })
+    monkeypatch.setattr(routes, "get_settings", lambda: settings)
+    calls = []
+
+    class Provider:
+        def __init__(self, name):
+            self.name = name
+
+        async def tool_stream(self, _messages, _tools):
+            calls.append(self.name)
+            if calls.count("gigachat") == 2 and self.name == "gigachat":
+                raise GatewayError("oauth_http_503")
+            yield f"Синтетический ответ {self.name}"
+
+    def create_agent(config, *, external_consent=False):
+        assert external_consent == (config.llm_provider == "gigachat")
+        return Provider(config.llm_provider)
+
+    def unexpected_fallback(*_):
+        pytest.fail("Explicit GigaChat request was sent to a fallback model")
+
+    monkeypatch.setattr(routes, "agent_gateway", create_agent)
+    monkeypatch.setattr(routes, "gateway", unexpected_fallback)
+    cid = client.post("/chat").json()["id"]
+    history_path = f"/chat/{cid}"
+    path = f"{history_path}/messages"
+    payload = {"content": "Синтетическое сообщение", "llm_provider": "gigachat"}
+    allowed = {**payload, "external_consent": "gigachat"}
+
+    history = client.get(history_path).json()
+    assert history["llm_providers"]["gigachat"]["status"] == "not_configured"
+    missing = client.post(path, json=allowed)
+    assert missing.status_code == 503
+    assert missing.json()["detail"] == {"code": "gigachat_not_configured"}
+
+    secret = "synthetic-authorization-value"
+    settings = settings.model_copy(update={
+        "gigachat_credentials": SecretStr(secret), "gigachat_ca_bundle": "/missing/synthetic.pem",
+    })
+    assert client.get(history_path).json()["llm_providers"]["gigachat"]["status"] == "unavailable"
+    unavailable = client.post(path, json=allowed)
+    assert unavailable.status_code == 503
+    assert unavailable.json()["detail"] == {"code": "gigachat_unavailable"}
+    assert not calls and client.get(history_path).json()["messages"] == []
+
+    settings = settings.model_copy(update={"gigachat_ca_bundle": ""})
+    history_response = client.get(history_path)
+    assert secret not in history_response.text
+    assert history_response.json()["llm_providers"] == {
+        "ollama": {"model": settings.llm_model, "status": "ready"},
+        "gigachat": {"model": "GigaChat-3-Ultra", "status": "ready"},
+    }
+    assert client.post(path, json={**payload, "llm_provider": "other"}).status_code == 422
+    denied = client.post(path, json=payload)
+    assert denied.status_code == 403
+    assert denied.json()["detail"] == {"code": "external_consent_required"}
+    assert not calls and client.get(history_path).json()["messages"] == []
+
+    for body in ({**payload, "llm_provider": "ollama"}, allowed):
+        response = client.post(path, json=body)
+        assert response.status_code == 200
+        assert json.loads(response.text.splitlines()[-1])["type"] == "done"
+    assert client.post(path, json=payload).status_code == 403
+    assert calls == ["ollama", "gigachat"]
+
+    failed = client.post(path, json=allowed)
+    assert json.loads(failed.text.splitlines()[-1]) == {
+        "type": "error", "code": "gigachat_unavailable",
+    }
+    assert calls == ["ollama", "gigachat", "gigachat"]
+    assert [m["content"] for m in client.get(history_path).json()["messages"]
+            if m["role"] == "assistant"] == [
+        "Синтетический ответ ollama", "Синтетический ответ gigachat",
+    ]
 
 
 def test_native_agent_dialogue_sources_and_fallback(setup, monkeypatch, caplog):
@@ -410,6 +655,7 @@ def test_native_agent_dialogue_sources_and_fallback(setup, monkeypatch, caplog):
         assert payload["stream"] is True and "format" not in payload
         assert {tool["function"]["name"] for tool in payload["tools"]} == {
             "get_documents", "search_documents", "analyze_measurements",
+            "search_medical_knowledge", "search_pubmed",
         }
         payloads.append(payload)
         name, value = next(cases)
@@ -604,7 +850,8 @@ def test_native_agent_gets_document_contents_in_one_tool_call(
         assert "chat_agent_fallback" not in caplog.text
     else:
         assert "chat_agent_fallback" in caplog.text and "code=agent_data_unavailable" in caplog.text
-    assert all(text not in caplog.text for text in ("owned-six.pdf", "private-six.pdf", "Creatinine"))
+    sensitive = ("owned-six.pdf", "private-six.pdf", "Creatinine")
+    assert all(text not in caplog.text for text in sensitive)
 
 
 def test_structured_chat_uses_confirmed_measurements_and_owned_sources(setup, monkeypatch):

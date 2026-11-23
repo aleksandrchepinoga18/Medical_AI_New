@@ -7,7 +7,7 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from contextvars import ContextVar
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Any, Protocol, TypeVar
+from typing import Any, Literal, Protocol, TypeVar
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -15,6 +15,8 @@ from pydantic import BaseModel, ValidationError
 from app.core.config import Settings
 
 T = TypeVar("T", bound=BaseModel)
+LLMProvider = Literal["ollama", "gigachat"]
+ProviderStatus = Literal["ready", "not_configured", "unavailable"]
 logger = logging.getLogger("uvicorn.error").getChild("ollama")
 generation_log_id: ContextVar[str] = ContextVar("llm_generation_id", default="-")
 
@@ -229,13 +231,32 @@ class Gateway:
             raise GatewayError(code) from None
 
 
+def provider_status(settings: Settings, provider: LLMProvider) -> ProviderStatus:
+    """Check local configuration without contacting either provider."""
+    if provider == "ollama":
+        return "ready" if settings.llm_model.strip() else "not_configured"
+    if not settings.gigachat_credentials.get_secret_value().strip():
+        return "not_configured"
+    if settings.gigachat_ca_bundle:
+        from app.documents.gigachat import gigachat_tls_context
+
+        try:
+            gigachat_tls_context(settings.gigachat_ca_bundle)
+        except (OSError, ValueError):
+            return "unavailable"
+    return "ready"
+
+
 def gateway(
     settings: Settings, provider: str | None = None, *, external_consent: bool = False,
 ) -> Gateway:
     selected = settings.llm_provider if provider is None else provider
     if selected == "ollama":
         return Gateway(Ollama(settings))
-    if selected == "gigachat" and settings.llm_provider == "gigachat" and external_consent:
+    if (
+        selected == "gigachat" and external_consent
+        and provider_status(settings, "gigachat") == "ready"
+    ):
         from app.llm.gigachat import GigaChat
 
         return Gateway(GigaChat(settings))

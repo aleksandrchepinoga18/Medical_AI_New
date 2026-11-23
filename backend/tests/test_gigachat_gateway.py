@@ -47,6 +47,12 @@ def test_cloud_factory_requires_config_and_explicit_opt_in():
     with pytest.raises(GatewayError, match="provider_disabled"):
         gateway(Settings(redis_password="synthetic"), provider="gigachat", external_consent=True)
     assert isinstance(gateway(settings(), external_consent=True).provider, GigaChat)
+    local_default = settings().model_copy(update={"llm_provider": "ollama"})
+    with pytest.raises(GatewayError, match="provider_disabled"):
+        gateway(local_default, provider="gigachat")
+    assert isinstance(
+        gateway(local_default, provider="gigachat", external_consent=True).provider, GigaChat,
+    )
 
 
 def test_function_calls_sse_round_trip_and_oauth_reuse():
@@ -114,7 +120,10 @@ def test_sse_round_trip_with_the_real_agent_functions():
         assert payload["max_tokens"] == 2048 and payload["temperature"] == 0.2
         assert "options" not in payload and "response_format" not in payload
         functions = {item["name"]: item["parameters"] for item in payload["functions"]}
-        assert set(functions) == {"get_documents", "search_documents", "analyze_measurements"}
+        assert set(functions) == {
+            "get_documents", "search_documents", "analyze_measurements",
+            "search_medical_knowledge", "search_pubmed",
+        }
         assert set(functions["get_documents"]["properties"]) == {"documents", "after"}
         assert set(functions["search_documents"]["properties"]) == {"query", "documents"}
         assert set(functions["analyze_measurements"]["properties"]) == {
@@ -123,10 +132,14 @@ def test_sse_round_trip_with_the_real_agent_functions():
         assert functions["search_documents"]["required"] == ["query"]
         assert set(functions["analyze_measurements"]["required"]) == {"operation", "documents"}
         assert "required" not in functions["get_documents"]
+        for name in ("search_medical_knowledge", "search_pubmed"):
+            assert functions[name]["required"] == ["query"]
+            assert functions[name]["properties"]["query"]["type"] == "string"
         for name, parameters in functions.items():
             assert parameters["type"] == "object"
             assert set(parameters) <= {"type", "properties", "required"}
-            assert parameters["properties"]["documents"]["items"]["type"] == "integer"
+            if "documents" in parameters["properties"]:
+                assert parameters["properties"]["documents"]["items"]["type"] == "integer"
             for field, property_schema in parameters["properties"].items():
                 assert set(property_schema) <= {"type", "description", "items", "enum"}
                 source = original[name]["properties"][field]
@@ -207,7 +220,7 @@ def test_422_diagnostic_does_not_log_echoed_values(caplog):
     with pytest.raises(GatewayError, match="^gigachat_http_422$"):
         asyncio.run(fetch())
     assert "gigachat_validation_rejected" in caplog.text
-    assert "reason=function_schema messages=1 functions=3 function_call=auto" in caplog.text
+    assert "reason=function_schema messages=1 functions=5 function_call=auto" in caplog.text
     assert secret_input not in caplog.text and reflected_token not in caplog.text
 
 

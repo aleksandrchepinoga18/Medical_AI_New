@@ -4,8 +4,10 @@ from uuid import uuid4
 
 import pymupdf
 import pytest
+from sqlalchemy.orm import Session
 
-from app.chat.agent import AgentEvidence, document_contents
+from app.chat import agent
+from app.chat.agent import AgentEvidence, ToolResult, document_contents
 from app.chat.document_context import (
     Extraction,
     excerpt_payload,
@@ -27,11 +29,13 @@ from app.chat.evidence import (
     select_evidence,
 )
 from app.chat.lab_tables import table_measurements
-from app.chat.structured_context import measurement_mode
+from app.chat.structured_context import measurement_mode, structured_context
+from app.core.config import Settings
 from app.documents.extract import extract_pdf
 from app.documents.extraction_data import ExtractionResult
 from app.documents.models import Document, DocumentTextVersion
 from app.documents.providers import local_report
+from app.llm.gateway import ToolCall
 from evaluation.extraction_fixtures import load_fixtures, render
 
 
@@ -64,6 +68,76 @@ def test_document_tool_packs_all_five_confirmed_measurements_when_they_fit():
     payload = json.loads(rendered)
     assert "error" not in payload
     assert {source["page"] for source in payload["sources"]} == {1, 2}
+
+
+def test_measurement_tool_fits_confirmed_trend_and_citations_in_remaining_context(monkeypatch):
+    def document(number, rows):
+        text = "Синтетическая таблица."
+        return Extraction(
+            Document(
+                id=uuid4(), original_filename=f"synthetic-{number}.pdf", document_number=number,
+            ),
+            DocumentTextVersion(
+                id=uuid4(), normalized_text=text,
+                locators=[{"kind": "page", "index": 1, "start": 0, "end": len(text)}],
+                structured_result={"schema_version": 1, "local": {
+                    "provider": "pymupdf_tables", "provider_version": "synthetic",
+                    "measurements": [
+                        {
+                            "name": name, "value": value, "unit": unit, "reference": reference,
+                            "date": when, "confirmation": "confirmed",
+                            "source": {"page": 1, "bbox": [10, i * 20, 100, i * 20 + 10]},
+                        }
+                        for i, (name, value, unit, reference, when) in enumerate(rows, 1)
+                    ],
+                }},
+            ),
+        )
+
+    documents = [
+        document(1, [("Albumin", "4.2", "g/dL", "3.5–5.0", "2026-10-02")]),
+        document(2, [
+            ("Albumin", "4.2", "g/dL", "3.5–5.0", "2026-10-16"),
+            ("Potassium", "4.3", "mmol/L", "3.5–5.1", "2026-10-16"),
+        ]),
+    ]
+    indicators = ["альбумина", "Potassium"]
+    call = ToolCall("analyze_measurements", {
+        "operation": "trend", "documents": [1, 2], "indicators": indicators,
+    })
+    budget = 786
+    verbose = structured_context(
+        documents, "trend", "", budget // 2, indicators=indicators, confirmed_only=True,
+    )
+    assert verbose is not None and len(verbose.hits) == 3
+    verbose_tool_result = ToolResult(
+        {"result": verbose.answer, "partial": verbose.partial}, verbose.hits, calculated=True,
+    )
+    assert AgentEvidence().render(verbose_tool_result, budget) == '{"error":"result_too_large"}'
+
+    monkeypatch.setattr(agent, "resolve_documents", lambda *_: (documents, None))
+    with Session() as db:
+        result = agent.execute_tool(
+            db, uuid4(), Settings(redis_password="synthetic"), call, budget, (1, 2),
+        )
+    evidence = AgentEvidence()
+    rendered = evidence.render(result, budget)
+    assert len(rendered.encode()) <= budget
+    payload = json.loads(rendered)
+    assert payload["confirmed"] is True and payload["partial"] is False
+    assert all(part in payload["result"] for part in (
+        "2026-10-02 · №1: 4.2 g/dL", "2026-10-16 · №2: 4.2 g/dL",
+        "2026-10-16 · №2: 4.3 mmol/L", "3.5–5.0", "3.5–5.1", "+0.0 g/dL", "+0.00%",
+        "Недостаточно измерений",
+    ))
+    assert payload["sources"] == [
+        {"document_number": 1, "page": 1, "id": "S1"},
+        {"document_number": 2, "page": 1, "id": "S2"},
+    ]
+    assert len(evidence.hits) == 3
+    assert all(
+        hit["structured_digest"] and "#source-page-1" in hit["source_url"] for hit in evidence.hits
+    )
 
 
 def hit(text, *, page=1, filename="synthetic.pdf"):

@@ -1,4 +1,4 @@
-"""Bounded native Ollama tool loop for the medical chat."""
+"""Bounded tool loop shared by Ollama and GigaChat."""
 
 import json
 import logging
@@ -8,6 +8,7 @@ from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from anyio import to_thread
+from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
@@ -21,10 +22,19 @@ from app.chat.document_context import (
     extraction_hit,
     resolve_documents,
 )
-from app.chat.evidence import EvidenceHit
+from app.chat.evidence import MISSING, EvidenceHit, needs_documents
+from app.chat.medical_sources import (
+    knowledge_hit,
+    public_citation_key,
+    publication_hit,
+    pubmed_query,
+)
 from app.chat.structured_context import structured_context
 from app.core.config import Settings
 from app.documents.models import Document
+from app.knowledge import pubmed
+from app.knowledge.schemas import PubMedSearch
+from app.knowledge.service import search as search_knowledge
 from app.llm.gateway import Gateway, GatewayError, ToolCall, generation_log_id
 from app.rag.adapters import OllamaEmbeddings, QdrantVectors, RagError
 from app.rag.service import search
@@ -81,6 +91,20 @@ class AnalyzeMeasurements(ToolArguments):
     )
 
 
+class SearchMedicalKnowledge(ToolArguments):
+    query: str = Field(min_length=1, max_length=400, description="General medical topic.")
+
+
+class SearchPubMed(ToolArguments):
+    query: str = Field(
+        min_length=1, max_length=200,
+        description=(
+            "One to three exact pubmed_topics joined by AND, or explicit PMID or DOI from "
+            "this question. Never put personal data, measurements, or document text here."
+        ),
+    )
+
+
 TOOLS: dict[str, tuple[type[ToolArguments], str]] = {
     "get_documents": (
         ListDocuments, "Read selected documents with measurements, or list the catalogue.",
@@ -90,20 +114,79 @@ TOOLS: dict[str, tuple[type[ToolArguments], str]] = {
         AnalyzeMeasurements,
         "Confirmed values, dated absolute and percent change, two-document comparison, or ranges.",
     ),
+    "search_medical_knowledge": (SearchMedicalKnowledge, "Published shared medical references."),
+    "search_pubmed": (SearchPubMed, "Search studies by public topic, PMID or DOI."),
+}
+PUBLIC_TOOLS = {"search_medical_knowledge", "search_pubmed"}
+PUBLIC_NOTICES = {
+    "search_medical_knowledge": "В медицинской базе нет подходящих опубликованных фрагментов.",
+    "search_pubmed": "В PubMed не найдены подходящие публикации.",
+    "knowledge_unavailable": "Медицинская база знаний временно недоступна.",
+    "pubmed_unavailable": "PubMed временно недоступен.",
+    "pubmed_query_blocked": (
+        "Поиск PubMed в чате доступен по распознанным медицинским темам, PMID или DOI."
+    ),
 }
 
 
 def tool_definitions() -> list[dict[str, Any]]:
-    return [
-        {"type": "function", "function": {
-            "name": name, "description": description, "parameters": model.model_json_schema(),
-        }}
-        for name, (model, description) in TOOLS.items()
-    ]
+    tools = []
+    for name, (model, description) in TOOLS.items():
+        schema = model.model_json_schema()
+        # Function and property names already identify these schema nodes.
+        schema.pop("title", None)
+        for property_schema in schema["properties"].values():
+            property_schema.pop("title", None)
+        tools.append({"type": "function", "function": {
+            "name": name, "description": description, "parameters": schema,
+        }})
+    return tools
 
 
 def encode(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def message_bytes(messages: list[dict[str, Any]]) -> int:
+    # Providers decode the HTTP JSON before rendering messages. Count actual
+    # content once and include the envelope and serialized tool arguments.
+    envelope = [{**message, "content": ""} for message in messages]
+    content = sum(len(message["content"].encode()) for message in messages)
+    return len(encode(envelope).encode()) + content
+
+
+def model_public_fragment(
+    hit: dict[str, Any], label: str, budget: int,
+) -> dict[str, Any] | None:
+    kind = hit["kind"]
+    fields = ("chunk_id", "version") if kind == "medical_knowledge" else (
+        "authors", "journal", "year", "pmid", "doi",
+    )
+    fragment = {
+        "kind": kind, "source_id": label, "filename": hit["filename"],
+        "source_url": hit["source_url"], **{field: hit[field] for field in fields},
+    }
+    original = hit["text"]
+
+    def with_text(text: str) -> dict[str, Any]:
+        return {**fragment, "text": text or None, "partial": original != (text or None)}
+
+    if len(encode(with_text("")).encode()) + 1 > budget:
+        return None
+    # Search character boundaries and measure the JSON that will enter the prompt.
+    # This includes escaping, variable-width UTF-8, and the array separator.
+    prefix = (original or "").encode()[:1200].decode(errors="ignore")
+    low, high = 0, len(prefix)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(encode(with_text(prefix[:middle])).encode()) + 1 <= budget:
+            low = middle
+        else:
+            high = middle - 1
+    excerpt = prefix[:low].rstrip()
+    if kind == "medical_knowledge" and not excerpt:
+        return None
+    return with_text(excerpt)
 
 
 @dataclass
@@ -114,6 +197,7 @@ class ToolResult:
     calculated: bool = False
     status: Literal["ok", "empty", "not_found"] = "ok"
     document_count: int = 0
+    public_hits: list[dict[str, Any]] = field(default_factory=list)
 
 
 def document_contents(extractions: list[Extraction], budget: int) -> ToolResult:
@@ -169,7 +253,7 @@ def document_contents(extractions: list[Extraction], budget: int) -> ToolResult:
 
 def execute_tool(
     db: Session, user_id: UUID, settings: Settings, call: ToolCall, budget: int,
-    requested: tuple[int, ...],
+    requested: tuple[int, ...], question: str = "",
 ) -> ToolResult:
     if call.name not in TOOLS:
         return ToolResult({"error": "unknown_tool"})
@@ -178,6 +262,26 @@ def execute_tool(
         args = model.model_validate(call.arguments)
     except ValidationError:
         return ToolResult({"error": "invalid_arguments"})
+    if isinstance(args, SearchMedicalKnowledge):
+        try:
+            hits = search_knowledge(db, settings, args.query, min(settings.rag_search_max_k, 3))
+        except RagError:
+            return ToolResult({"error": "knowledge_unavailable"})
+        return ToolResult({}, status="ok" if hits else "empty",
+                          public_hits=[knowledge_hit(hit) for hit in hits])
+    if isinstance(args, SearchPubMed):
+        query = pubmed_query(args.query, question)
+        if query is None:
+            return ToolResult({"error": "pubmed_query_blocked"})
+        try:
+            entries = pubmed.search(
+                PubMedSearch(query=query, limit=3), settings.pubmed_contact_email,
+                include_access=False,
+            )
+        except HTTPException:
+            return ToolResult({"error": "pubmed_unavailable"})
+        return ToolResult({}, status="ok" if entries else "empty",
+                          public_hits=[publication_hit(entry) for entry in entries])
     assert isinstance(args, (ListDocuments, SearchDocuments, AnalyzeMeasurements))
     selected = list(dict.fromkeys(args.documents))
     extractions = []
@@ -216,7 +320,7 @@ def execute_tool(
             return ToolResult({"error": "two_documents_required"}, document_count=len(extractions))
         prepared = structured_context(
             extractions, args.operation, "", max(1, budget // 2),
-            indicators=args.indicators, confirmed_only=True,
+            indicators=args.indicators, confirmed_only=True, compact_trend=True,
         )
         if prepared is None:
             return ToolResult(
@@ -225,7 +329,8 @@ def execute_tool(
             )
         hits = [*prepared.hits, *(prepared.supporting_hits or [])]
         return ToolResult(
-            {"result": prepared.answer, "partial": prepared.partial}, hits, calculated=True,
+            {"result": prepared.answer, "partial": prepared.partial, "confirmed": bool(hits)},
+            hits, calculated=True,
             status="ok" if hits else "empty", document_count=len(extractions),
         )
     try:
@@ -255,6 +360,58 @@ class AgentEvidence:
     labels: dict[str, str] = field(default_factory=dict)
     calculation: tuple[str, list[EvidenceHit]] | None = None
     used_tools: bool = False
+    public_attempted: bool = False
+    public_hits: dict[str, dict[str, Any]] = field(default_factory=dict)
+    public_citations: list[dict[str, Any]] = field(default_factory=list)
+    notices: dict[str, str] = field(default_factory=dict)
+
+    def render_public(self, name: str, result: ToolResult) -> str:
+        self.public_attempted = True
+        if result.public_hits:
+            self.notices.pop(name, None)
+            for hit in result.public_hits:
+                self.public_hits.setdefault(public_citation_key(hit), hit)
+        elif result.data.get("error") != "repeated_tool" and not any(
+            hit["kind"] == ("pubmed" if name == "search_pubmed" else "medical_knowledge")
+            for hit in self.public_hits.values()
+        ):
+            code = result.data.get("error", name)
+            self.notices[name] = PUBLIC_NOTICES.get(code, PUBLIC_NOTICES[name])
+        return encode({
+            **result.data, "status": "error" if "error" in result.data else result.status,
+            "matches": len(result.public_hits),
+        })
+
+    def public_fragments(self, budget: int) -> list[dict[str, Any]]:
+        fragments = []
+        first: dict[str, str] = {}
+        for key, hit in self.public_hits.items():
+            first.setdefault(hit["kind"], key)
+        priority = list(first.values())
+        ordered = dict.fromkeys([*priority, *self.public_hits])
+        for key in ordered:
+            hit = self.public_hits[key]
+            share = budget // len(priority) if priority else budget
+            if priority:
+                priority.pop(0)
+            label = f"S{len(self.labels) + len(fragments) + 1}"
+            fragment = model_public_fragment(hit, label, share)
+            if fragment is None:
+                continue
+            citation = {key: value for key, value in hit.items() if key != "text"}
+            citation["source_id"] = label
+            if hit["kind"] == "medical_knowledge":
+                start = hit["start_char"]
+                end = start + len(fragment["text"])
+                citation["end_char"] = end
+                citation["sources"] = [
+                    locator for locator in hit["sources"]
+                    if locator["start"] < end and locator["end"] > start
+                ]
+            fragments.append(fragment)
+            self.public_citations.append(citation)
+            budget -= len(encode(fragment).encode()) + 1
+        return fragments
 
     def render(self, result: ToolResult, budget: int) -> str:
         if "error" in result.data:
@@ -331,9 +488,10 @@ def tool_messages(rounds: list[ToolRound]) -> list[dict[str, Any]]:
 async def run_agent(
     model: Gateway, messages: list[dict[str, Any]], settings: Settings,
     engine: Engine, user_id: UUID, evidence: AgentEvidence, room: int,
-    *, requested: tuple[int, ...], generation: UUID,
+    *, requested: tuple[int, ...], generation: UUID, question: str = "",
 ) -> list[str]:
     tools = tool_definitions()
+    answer_room = room
     definitions = len(encode(tools).encode())
     # Like the text chat, use a conservative byte estimate. Tool definitions mostly
     # contain ASCII JSON, which Ollama tokenizes much more compactly.
@@ -345,14 +503,62 @@ async def run_agent(
     attempted_data_lookup = False
     obtained_data = False
 
-    def available_for_result(context: list[ToolRound]) -> int:
-        remaining = room - len(encode(tool_messages(context)).encode()) - 96
+    def available_for_result(context: list[ToolRound], reply: dict[str, Any]) -> int:
+        remaining = room - message_bytes([*tool_messages(context), reply])
         return min(settings.generation_tool_chars, remaining)
 
+    async def finish(parts: list[str]) -> list[str]:
+        if (requested or attempted_data_lookup or needs_documents(question)) and not obtained_data:
+            evidence.notices["personal"] = MISSING
+        if not evidence.public_hits:
+            return parts if evidence.hits or evidence.catalog else []
+        personal = [
+            json.loads(message["content"]) for message in tool_messages(rounds)
+            if message["role"] == "tool" and message["tool_name"] not in PUBLIC_TOOLS
+        ]
+        request = json.loads(messages[-1]["content"])
+        payload = {
+            **request, "personal_results": personal, "public_evidence": [],
+            "limitations": list(evidence.notices.values()),
+        }
+        other_context = (
+            len(encode(payload).encode()) - len(messages[-1]["content"].encode())
+        )
+        budget = min(settings.generation_tool_chars, answer_room - other_context)
+        fragments = evidence.public_fragments(budget)
+        logger.info(
+            "chat_agent_public_evidence generation=%s matches=%d fragments=%d "
+            "excerpt_chars=%d excerpt_bytes=%d evidence_bytes=%d budget=%d",
+            generation, len(evidence.public_hits), len(fragments),
+            sum(len(fragment["text"] or "") for fragment in fragments),
+            sum(len((fragment["text"] or "").encode()) for fragment in fragments),
+            len(encode(fragments).encode()) - 2, budget,
+        )
+        found_kinds = {hit["kind"] for hit in evidence.public_hits.values()}
+        if found_kinds - {item["kind"] for item in fragments}:
+            evidence.notices["context"] = "Не хватило места для найденных медицинских источников."
+        if not fragments:
+            return parts if evidence.hits or evidence.catalog else []
+        # Public content is visible only for the tool-free answer. It cannot affect
+        # tool selection, arguments, or subsequent requests to external services.
+        payload["public_evidence"] = fragments
+        log_context = generation_log_id.set(str(generation))
+        try:
+            answer = [part async for part in model.stream([
+                messages[0], {"role": "user", "content": encode(payload)},
+            ])]
+            if not "".join(answer).strip():
+                raise GatewayError("agent_no_answer")
+            return answer
+        finally:
+            generation_log_id.reset(log_context)
+
     for round_number in range(1, MAX_ROUNDS + 1):
+        if round_number == MAX_ROUNDS and evidence.public_hits:
+            return await finish([])
         transcript = tool_messages(rounds)
-        used = len(encode(transcript).encode())
-        while history and used + len(encode(history).encode()) > room:
+        used = message_bytes(transcript)
+        while history and message_bytes([*history, *transcript]) > room:
             del history[:2]
         if used > room:
             raise GatewayError("agent_context_limit")
@@ -376,6 +582,8 @@ async def run_agent(
         finally:
             generation_log_id.reset(log_context)
         if not calls:
+            if evidence.public_attempted:
+                return await finish(parts or ["Доступных сведений недостаточно."])
             if not "".join(parts).strip():
                 raise GatewayError("agent_no_answer")
             if (seen and not evidence.used_tools) or (
@@ -389,34 +597,54 @@ async def run_agent(
             "tool_calls": [call.message() for call in calls],
         }])
         for call in calls:
-            key = json.dumps([call.name, call.arguments], sort_keys=True)
-            if key in seen:
+            public_query = (
+                pubmed_query(call.arguments["query"], question)
+                if call.name == "search_pubmed" and isinstance(call.arguments.get("query"), str)
+                else None
+            )
+            key = json.dumps([call.name, public_query or call.arguments], sort_keys=True)
+            if key in seen and call.name not in PUBLIC_TOOLS:
                 raise GatewayError("agent_repeated_tool")
+            repeated = key in seen
             seen.add(key)
             reads_document = call.name in ("search_documents", "analyze_measurements") or (
                 call.name == "get_documents" and bool(call.arguments.get("documents"))
             )
-            budget = available_for_result([*rounds, step])
+            reply = {"role": "tool", "tool_name": call.name, "content": ""}
+            budget = available_for_result([*rounds, step], reply)
             # Discard whole planning rounds only if their space is needed for a result.
             retained = (
                 [prior for prior in rounds if prior.has_document_result]
                 if reads_document else rounds
             )
-            expanded = available_for_result([*retained, step])
-            if expanded < 160:
+            expanded = available_for_result([*retained, step], reply)
+            too_large = encode({"error": "result_too_large"})
+            if expanded < len(too_large.encode()):
                 raise GatewayError("agent_context_limit")
 
             def execute(current: ToolCall = call, limit: int = expanded) -> ToolResult:
                 with Session(engine) as db:
-                    return execute_tool(db, user_id, settings, current, limit, requested)
+                    return execute_tool(db, user_id, settings, current, limit, requested, question)
 
-            result = await to_thread.run_sync(execute, abandon_on_cancel=True)
-            content = evidence.render(result, budget)
+            result = (
+                ToolResult({"error": "repeated_tool"})
+                if repeated else await to_thread.run_sync(execute, abandon_on_cancel=True)
+            )
+            content = (
+                evidence.render_public(call.name, result) if call.name in PUBLIC_TOOLS
+                else evidence.render(result, budget)
+            )
             error = json.loads(content).get("error")
             if error == "result_too_large" and expanded > budget:
                 content = evidence.render(result, expanded)
                 error = json.loads(content).get("error")
                 if error is None:
+                    rounds = retained
+                    budget = expanded
+            if len(content.encode()) > budget:
+                if len(content.encode()) > expanded:
+                    content, error = too_large, "result_too_large"
+                if len(content.encode()) > budget:
                     rounds = retained
             if reads_document:
                 attempted_data_lookup = True
@@ -429,8 +657,13 @@ async def run_agent(
                 generation, call.name if call.name in TOOLS else "unknown",
                 "error" if error else result.status, error or "-",
                 result.document_count, sum("measurement" in hit for hit in result.hits),
-                len({hit["source_url"] for hit in [*result.catalog, *result.hits]}),
+                len({hit["source_url"] for hit in [*result.catalog, *result.hits]})
+                + len(result.public_hits),
             )
-            step.messages.append({"role": "tool", "tool_name": call.name, "content": content})
+            step.messages.append({**reply, "content": content})
         rounds.append(step)
+    if evidence.public_attempted:
+        if evidence.public_hits:
+            evidence.notices["context"] = "Достигнут лимит шагов до обработки найденных источников."
+        return []
     raise GatewayError("agent_round_limit")

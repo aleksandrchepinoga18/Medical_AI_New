@@ -185,7 +185,9 @@ def annotate_access(client: httpx.Client, entries: list[PubMedHit]) -> None:
                 entry.full_text_url = entry.full_text_url or f"{entry.url}#linkout"
 
 
-def search(data: PubMedSearch, contact_email: str = "") -> list[PubMedHit]:
+def search(
+    data: PubMedSearch, contact_email: str = "", *, include_access: bool = True,
+) -> list[PubMedHit]:
     term, doi = search_term(data.query)
     params = {"term": term, "retmax": str(data.limit), "sort": "relevance"}
     if data.date_from or data.date_to:
@@ -199,7 +201,8 @@ def search(data: PubMedSearch, contact_email: str = "") -> list[PubMedHit]:
         entries = fetch_records(client, ids) if ids else []
         if doi is not None:
             entries = [entry for entry in entries if entry.doi == doi]
-        annotate_access(client, entries)
+        if include_access:
+            annotate_access(client, entries)
         return entries
 
 
