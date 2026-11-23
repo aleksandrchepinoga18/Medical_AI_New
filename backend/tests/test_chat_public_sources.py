@@ -10,7 +10,12 @@ from sqlalchemy.orm import Session
 
 from app.chat import agent
 from app.chat.answer_review import LIMITATION, review_prose
-from app.chat.medical_sources import pubmed_query, requests_pubmed, verified_answer_refs
+from app.chat.medical_sources import (
+    medical_reference_query,
+    pubmed_query,
+    requests_pubmed,
+    verified_answer_refs,
+)
 from app.chat.routes import AGENT_SYSTEM
 from app.core.config import Settings
 from app.knowledge import pubmed
@@ -71,6 +76,129 @@ HBA1C_QUESTION = "За какой период HbA1c отражает средн
 ])
 def test_pubmed_routing_depends_on_research_intent(question, expected):
     assert requests_pubmed(question) is expected
+
+
+@pytest.mark.parametrize("question", [
+    HBA1C_QUESTION,
+    "Что измеряет анализ на креатинин?",
+    "Что измеряет общий анализ крови?",
+    "Что такое диабет 2 типа?",
+    "Что входит в панель электролитов?",
+])
+def test_recognizes_explicit_medical_reference_questions(question):
+    assert medical_reference_query(question) == question
+
+
+@pytest.mark.parametrize(
+    "case", ["skipped", "called", "empty", "unavailable", "called_empty", "invalid_arguments"],
+)
+def test_medical_reference_lookup_uses_grounded_answer_and_does_not_repeat(monkeypatch, case):
+    searches, requests = [], []
+    reference = "The HbA1c test shows your average blood glucose over the past 2 to 3 months."
+    chunk_id = uuid4()
+    version_id = uuid4()
+
+    def retrieve(_db, _settings, query, _limit):
+        searches.append(query)
+        if case in {"empty", "called_empty"}:
+            return []
+        if case == "unavailable":
+            raise RagError("QDRANT_UNAVAILABLE")
+        return [{
+            "chunk_id": chunk_id, "text": reference, "start_char": 0,
+            "end_char": len(reference), "locators": [],
+            "source": {
+                "id": uuid4(), "version_id": version_id, "version": "1",
+                "title": "HbA1c reference", "url": HBA1C_SOURCE["source_url"],
+            },
+        }]
+
+    def respond(request):
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if "tools" not in payload:
+            evidence = json.loads(payload["messages"][-1]["content"])["public_evidence"]
+            assert len(evidence) == 1 and evidence[0]["text"] == reference
+            message = {"content": "HbA1c отражает средний уровень глюкозы за 2–3 месяца [S1]."}
+        elif (case.startswith("called") or case == "invalid_arguments") and len(requests) == 1:
+            query = {"query": "HbA1c"} if case != "invalid_arguments" else {}
+            message = {"tool_calls": [
+                ToolCall("search_medical_knowledge", query).message(),
+            ]}
+        else:
+            message = {"content": "HbA1c отражает средний уровень глюкозы за 18 месяцев."}
+        return httpx.Response(200, text=json.dumps({"message": message, "done": True}) + "\n")
+
+    monkeypatch.setattr(agent, "search_knowledge", retrieve)
+    config = settings()
+    model = Gateway(Ollama(config, httpx.MockTransport(respond)))
+    engine = create_engine("sqlite://")
+    evidence = agent.AgentEvidence()
+    try:
+        parts = asyncio.run(agent.run_agent(
+            model, [{"role": "system", "content": AGENT_SYSTEM},
+                    {"role": "user", "content": json.dumps({"question": HBA1C_QUESTION})}],
+            config, engine, uuid4(), evidence, 3000, requested=(), generation=uuid4(),
+            question=HBA1C_QUESTION,
+        ))
+    finally:
+        engine.dispose()
+
+    started_by_model = case.startswith("called")
+    assert searches == ["HbA1c" if started_by_model else HBA1C_QUESTION]
+    if case in {"empty", "unavailable", "called_empty"}:
+        assert parts == [] and evidence.public_citations == []
+        notice = "knowledge_unavailable" if case == "unavailable" else "search_medical_knowledge"
+        assert evidence.notices["search_medical_knowledge"] == agent.PUBLIC_NOTICES[notice]
+        assert len(requests) == (2 if started_by_model else 1)
+    else:
+        assert len(requests) == (3 if started_by_model or case == "invalid_arguments" else 2)
+        assert "2–3 месяца [S1]" in "".join(parts)
+        (citation,) = evidence.public_citations
+        assert citation["chunk_id"] == str(chunk_id) and citation["version_id"] == str(version_id)
+        assert citation["source_url"] == HBA1C_SOURCE["source_url"]
+
+
+@pytest.mark.parametrize(("question", "requested"), [
+    ("Что показывает мой HbA1c в документе №1?", (1,)),
+    ("Что значит мой HbA1c?", ()),
+    ("Что показывает HbA1c по данным исследований PubMed?", ()),
+    ("Найди PubMed по PMID 19671910.", ()),
+    ("Что такое планета?", ()),
+    ("Что такое Alt на клавиатуре?", ()),
+    ("Что такое HbA1c и сколько будет 2+2?", ()),
+    ("Вычисли 2 + 2.", ()),
+])
+def test_skipped_tool_does_not_trigger_lookup_outside_reference_questions(
+    monkeypatch, question, requested,
+):
+    def tool(*_args):
+        pytest.fail("The agent must not run a tool automatically for this question")
+
+    monkeypatch.setattr(agent, "execute_tool", tool)
+    config = settings()
+    response = {"message": {"content": "Синтетический ответ."}, "done": True}
+    model = Gateway(Ollama(config, httpx.MockTransport(
+        lambda _: httpx.Response(200, text=json.dumps(response) + "\n"),
+    )))
+    engine = create_engine("sqlite://")
+
+    def run():
+        return asyncio.run(agent.run_agent(
+            model, [{"role": "system", "content": AGENT_SYSTEM},
+                    {"role": "user", "content": json.dumps({"question": question})}],
+            config, engine, uuid4(), agent.AgentEvidence(), 3000, requested=requested,
+            generation=uuid4(), question=question,
+        ))
+
+    try:
+        if requested:
+            with pytest.raises(GatewayError, match="agent_data_unavailable"):
+                run()
+        else:
+            assert run() == ["Синтетический ответ."]
+    finally:
+        engine.dispose()
 
 
 def test_unrequested_pubmed_failure_is_not_a_public_limitation():

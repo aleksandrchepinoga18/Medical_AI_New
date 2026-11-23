@@ -7,7 +7,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.chat.evidence import normalized
+from app.chat.evidence import needs_documents, normalized
 from app.core.config import Settings
 from app.knowledge import pubmed
 from app.knowledge.models import MedicalChunk, MedicalSource, MedicalVersion
@@ -85,6 +85,22 @@ _DECLINED_RESEARCH = re.compile(
     r"(?:(?:новых|научн\w*|клиническ\w*)\s+)?"
     r"(?:pubmed|пабмед|стат\w*|исследовани\w*|публикаци\w*|доказательств\w*)\b",
 )
+_REFERENCE_QUESTION = re.compile(
+    r"^(?:пожалуйста[ ,]+)?(?:что (?:такое|показыва\w*|измеря\w*|означа\w*|"
+    r"отража\w*|определя\w*|значит|входит в)|за (?:какой период|сколько времени)|"
+    r"какие (?:вещества|показатели|клетки)\b|объясни(?:те)?|what (?:is|are|does)|how long)\b"
+)
+_REFERENCE_TOPIC = re.compile(
+    r"\b(?:электролит\w*|печеночн\w* проб\w*|cbc|electrolytes?|liver (?:function )?tests?)\b"
+)
+_PERSONAL_OR_CALCULATION = re.compile(
+    r"\b(?:мой|моя|мои|моего|моей|моем|моих|моим|мою|у меня|у пациента|my|mine|"
+    r"(?:в|из|по) (?:этом |этом же |предыдущем |предыдущему )?(?:документ\w*|файл\w*|"
+    r"выписк\w*)|вычисл\w*|посчита\w*|рассчита\w*|calculate|compute)\b"
+    r"|\d\s*[+×*/=]\s*\d|\d\s*(?:%|(?:mg|mmol)/[dl]+\b|(?:мг|ммоль)/[дл]+\b)"
+)
+_AMBIGUOUS_TOPICS = {"alanine aminotransferase", "aspartate aminotransferase"}
+_CLINICAL_CONTEXT = re.compile(r"\b(?:анализ\w*|кров\w*|печен\w*|алт|аст|blood|liver|test)\b")
 _URL_IN_ANSWER = re.compile(r"(?:https?://|www\.)[^\s)\]<>]+", re.I)
 _MARKDOWN_URL = re.compile(
     r"(?<!\[)\[+((?:\[S[0-9]+\]|[^\[\]\r\n])+)"
@@ -100,6 +116,23 @@ _ID_IN_ANSWER = re.compile(
 def public_topics(question: str) -> tuple[str, ...]:
     question = normalized(question)
     return tuple(topic for topic, pattern in _TOPICS.items() if pattern.search(question))
+
+
+def medical_reference_query(question: str) -> str | None:
+    """Select only explicit general reference questions for a local lookup."""
+    query = question.strip()
+    text = normalized(query)
+    if (
+        len(query) > 400 or not _REFERENCE_QUESTION.search(text)
+        or needs_documents(query) or _PERSONAL_OR_CALCULATION.search(text)
+    ):
+        return None
+    topics = set(public_topics(text))
+    if topics - _AMBIGUOUS_TOPICS or _REFERENCE_TOPIC.search(text):
+        return query
+    if topics and _CLINICAL_CONTEXT.search(text):
+        return query
+    return None
 
 
 def requests_pubmed(question: str) -> bool:

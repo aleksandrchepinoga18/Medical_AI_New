@@ -1,16 +1,22 @@
+import json
 from argparse import Namespace
 from asyncio import run
 from contextlib import nullcontext
 from os import environ
+from ssl import CERT_REQUIRED
+from time import time
 from types import SimpleNamespace
 from uuid import uuid4
 
 import httpx
 import pytest
+from certifi import where
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.llm import gigachat
 from app.llm.gateway import GatewayError, ToolCall
 from app.rag.adapters import JsonHttp
 from evaluation import chat_runtime
@@ -125,6 +131,7 @@ def test_dry_run_does_not_invoke_evaluation_or_mlflow(monkeypatch):
         pytest.fail("dry-run called evaluation or tracking")
 
     monkeypatch.setattr(evaluate_chat, "evaluate", unexpected)
+    monkeypatch.setattr(evaluate_chat, "check_gigachat_oauth", unexpected)
     monkeypatch.setattr(evaluate_chat, "register", unexpected)
     result = evaluate_chat.safe_report(Namespace(
         dry_run=True, provider="ollama", mode="offline", retrieval="fixed",
@@ -133,6 +140,73 @@ def test_dry_run_does_not_invoke_evaluation_or_mlflow(monkeypatch):
     assert result["state"] == "configuration_checked"
     assert result["scenarios_expected"] == 1 and result["selected_cases"] == ["cbc-reference"]
     assert "summary" not in result and "cases" not in result
+
+
+@pytest.mark.parametrize(
+    ("oauth_error", "probe_only"),
+    [(None, True), ("oauth_transport", False), ("oauth_http_401", False)],
+)
+def test_gigachat_preflight_checks_oauth_before_evaluation(monkeypatch, oauth_error, probe_only):
+    settings = Settings(llm_provider="gigachat", gigachat_credentials=SecretStr("fixture-key"))
+    monkeypatch.setattr(evaluate_chat, "isolated_settings", lambda *args, **kwargs: settings)
+    async_client = httpx.AsyncClient
+    seen = []
+
+    def oauth(request):
+        seen.append(request.url.path)
+        assert request.url.scheme == "https" and request.url.port == 9443
+        assert request.headers["Authorization"] == "Basic fixture-key"
+        if oauth_error == "oauth_transport":
+            raise httpx.ConnectError("fixture-key must not escape", request=request)
+        if oauth_error == "oauth_http_401":
+            return httpx.Response(401, text="fixture-key must not escape")
+        return httpx.Response(200, json={
+            "access_token": "fixture-token", "expires_at": int((time() + 60) * 1000),
+        })
+
+    def client(**kwargs):
+        assert kwargs["verify"].check_hostname and kwargs["verify"].verify_mode == CERT_REQUIRED
+        assert kwargs["trust_env"] is False and kwargs["follow_redirects"] is False
+        return async_client(transport=httpx.MockTransport(oauth), **kwargs)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("OAuth preflight must finish before running scenarios or writing to MLflow")
+
+    monkeypatch.setattr(evaluate_chat.httpx, "AsyncClient", client)
+    monkeypatch.setattr(evaluate_chat, "evaluate", unexpected)
+    monkeypatch.setattr(evaluate_chat, "register", unexpected)
+    args = Namespace(
+        dry_run=False, preflight_only=probe_only, provider="gigachat", mode="live",
+        retrieval="fixed", commit="6a1953f", mlflow_uri=None, allow_synthetic_cloud=True,
+    )
+    if oauth_error:
+        with pytest.raises(ValueError, match=f"^{oauth_error}$"):
+            evaluate_chat.safe_report(args)
+    else:
+        result = evaluate_chat.safe_report(args)
+        assert result["state"] == "gigachat_oauth_checked"
+        assert "fixture-key" not in repr(result) and "fixture-token" not in repr(result)
+    assert seen == ["/api/v2/oauth"]
+
+
+def test_gigachat_preflight_requires_local_ca(monkeypatch, tmp_path):
+    settings = Settings(
+        redis_password="synthetic", postgres_db="medical_ai_rag_test",
+        postgres_user="synthetic_rag_user", rag_collection="medical_ai_personal_test",
+        gigachat_credentials=SecretStr("fixture-key"),
+    )
+    path = tmp_path / "ca.crt"
+    monkeypatch.setenv("RUN_RAG_INTEGRATION", "1")
+    monkeypatch.setattr(chat_runtime, "get_settings", lambda: settings)
+    settings = settings.model_copy(update={"gigachat_ca_bundle": str(path)})
+    with pytest.raises(ValueError, match="^gigachat_ca_missing$"):
+        chat_runtime.isolated_settings("gigachat", live=True, live_retrieval=False)
+    path.write_text("invalid fixture PEM", encoding="utf-8")
+    with pytest.raises(ValueError, match="^gigachat_ca_invalid$"):
+        chat_runtime.isolated_settings("gigachat", live=True, live_retrieval=False)
+    assert not chat_runtime.isolated_settings(
+        "gigachat", live=False, live_retrieval=False,
+    ).gigachat_ca_bundle
 
 
 def test_evaluation_reports_llm_phase_and_safe_errors(capsys):
@@ -196,7 +270,10 @@ def test_history_probe_rechecks_stored_source_without_model_citations(monkeypatc
     if environ.get("RUN_RAG_INTEGRATION") != "1":
         pytest.skip("Use the isolated RAG test database")
     dataset, _ = evaluate_chat.load_dataset()
-    dataset["cases"] = [row for row in dataset["cases"] if row["id"] == "history-recheck"]
+    # A bare topic preserves the no-citation precondition independently of reference routing.
+    dataset["cases"] = [
+        {**row, "question": "HbA1c"} for row in dataset["cases"] if row["id"] == "history-recheck"
+    ]
     dataset["documents"] = []
     dataset["corpus"] = [item for item in dataset["corpus"] if item["id"] == "a1c"]
 
@@ -216,6 +293,109 @@ def test_history_probe_rechecks_stored_source_without_model_citations(monkeypatc
     assert row["answer"]["status"] == "partial" and row["error"] is None
     assert row["history_probe"] == ("source_still_visible" if leaks else "passed")
     assert row["checks"] == {"history_recheck": not leaks}
+
+
+@pytest.mark.integration
+def test_live_evaluation_matches_gigachat_chat_payload(monkeypatch):
+    if environ.get("RUN_RAG_INTEGRATION") != "1":
+        pytest.skip("Use the isolated RAG test database")
+    dataset, _ = evaluate_chat.load_dataset()
+    case = next(row for row in dataset["cases"] if row["id"] == "a1c-period")
+    dataset = {
+        **dataset, "cases": [case], "documents": [],
+        "corpus": [item for item in dataset["corpus"] if item["id"] == "a1c"],
+    }
+    settings = chat_runtime.get_settings().model_copy(update={
+        "llm_provider": "ollama", "chat_enabled": True, "rag_enabled": True,
+        "gigachat_credentials": SecretStr("fixture-key"), "gigachat_ca_bundle": where(),
+        "llm_gigachat_context_tokens": 20000, "llm_gigachat_max_tokens": 1700,
+        "llm_gigachat_timeout_seconds": 40,
+        "chat_gigachat_history_chars": 4500, "chat_gigachat_context_chars": 7500,
+    })
+    monkeypatch.setattr(chat_runtime, "get_settings", lambda: settings)
+    monkeypatch.setattr(chat_runtime.routes, "get_settings", lambda: settings)
+    payloads, limits = [], []
+
+    def respond(request):
+        if request.url.path == "/api/v2/oauth":
+            return httpx.Response(200, json={
+                "access_token": "fixture-token", "expires_at": int(time()) + 1800,
+            })
+        assert request.url.path == "/v1/chat/completions"
+        payload = json.loads(request.content)
+        payloads.append(payload)
+        reply = (
+            "HbA1c отражает средний уровень глюкозы за последние 2–3 месяца [S1]."
+            if payload["function_call"] == "none"
+            else "HbA1c отражает средний уровень глюкозы за последние 18 месяцев."
+        )
+        event = {"choices": [{
+            "delta": {"content": reply}, "finish_reason": "stop",
+        }]}
+        return httpx.Response(200, text=f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n")
+
+    adapter = gigachat.GigaChat
+
+    def mocked_transport(config):
+        limits.append((
+            config.generation_context, config.generation_output, config.generation_timeout,
+            config.generation_history_chars, config.generation_tool_chars,
+        ))
+        return adapter(config, httpx.MockTransport(respond))
+
+    monkeypatch.setattr(gigachat, "GigaChat", mocked_transport)
+    # Keep the regular chat's lookup local and deterministic without seeding a vector store.
+    with (
+        monkeypatch.context() as ordinary_chat,
+        TestClient(chat_runtime.app, client=(uuid4().hex, 50000)) as client,
+    ):
+        ordinary_chat.setattr(chat_runtime.agent, "search_knowledge", lambda *_args: [])
+        chat_runtime.registered(client)
+        created = client.post("/chat", headers=chat_runtime.headers(client))
+        created.raise_for_status()
+        response = client.post(
+            f"/chat/{created.json()['id']}/messages", headers=chat_runtime.headers(client),
+            json={
+                "content": case["question"], "llm_provider": "gigachat",
+                "external_consent": "gigachat",
+            },
+        )
+        response.raise_for_status()
+        events = [json.loads(line) for line in response.text.splitlines()]
+        assert events[-1] == {"type": "done", "sources": []}
+        assert "нет подходящих опубликованных фрагментов" in events[-2]["text"]
+        assert "18 месяцев" not in events[-2]["text"]
+
+    (row,) = evaluate(
+        dataset, "gigachat", live=True, live_retrieval=False, allow_synthetic_cloud=True,
+    )
+    ordinary, evaluation, grounded = payloads
+    assert ordinary == evaluation
+    assert limits == [(20000, 1700, 40, 4500, 7500)] * 2
+    assert ordinary["function_call"] == "auto"
+    assert ordinary["model"] == "GigaChat-3-Ultra" and ordinary["max_tokens"] == 1700
+    assert ordinary["messages"] == [
+        {"role": "system", "content": chat_runtime.routes.AGENT_SYSTEM},
+        {"role": "user", "content": chat_runtime.agent.encode({
+            "question": case["question"], "active_documents": [],
+        })},
+    ]
+    offered = [function["name"] for function in ordinary["functions"]]
+    assert offered == [
+        "get_documents", "search_documents", "analyze_measurements", "search_medical_knowledge",
+    ]
+    call, answer = row["llm_requests"]
+    assert call["offered_tools"] == offered and call["finish_reason"] == "stop"
+    assert call["received_text"] and call["tools"] == [] and call["error"] is None
+    assert answer["phase"] == "grounded_answer" and answer["offered_tools"] == []
+    assert grounded["function_call"] == "none" and "functions" not in grounded
+    fragments = json.loads(grounded["messages"][-1]["content"])["public_evidence"]
+    assert fragments[0]["source_id"] == "S1" and "2 to 3 months" in fragments[0]["text"]
+    assert row["routing_ok"] and row["missing_tools"] == []
+    assert [tool["name"] for tool in row["tools"]] == ["search_medical_knowledge"]
+    assert row["answer"]["status"] == "correct"
+    assert row["answer"]["required_source_hits"] == 1 and row["error"] is None
+    assert row["retrieval"]["first_relevant_rank"] == 1
 
 
 def test_offline_qdrant_accepts_only_the_synthetic_stand_and_bge_m3(monkeypatch):

@@ -5,6 +5,7 @@ import csv
 import hashlib
 import json
 import re
+from asyncio import run
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,9 @@ import httpx
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.chat.agent import MAX_CALLS, MAX_ROUNDS
+from app.core.config import Settings
+from app.documents.gigachat import GigaChatExtraction, gigachat_tls_context
+from app.llm.gateway import GatewayError
 from app.rag.adapters import RagError
 from evaluation.chat_metrics import compare_reports, summarize
 from evaluation.chat_runtime import SAFE_ERRORS, evaluate, isolated_settings
@@ -25,6 +29,41 @@ LIMITATIONS = [
     "Offline model timings and fixed retrieval timings are fixture timings.",
     "Live model aggregates exclude injected model output and consent-only checks.",
 ]
+GIGACHAT_PREFLIGHT_ERRORS = {
+    "gigachat_credentials_missing": "pass GIGACHAT_CREDENTIALS for this run",
+    "gigachat_ca_missing": "mount the PEM and set GIGACHAT_CA_BUNDLE",
+    "gigachat_ca_invalid": "GIGACHAT_CA_BUNDLE cannot be loaded as a trusted CA bundle",
+    "oauth_transport": "check live Evaluation egress, DNS and outbound TCP port 9443",
+    "oauth_timeout": "the OAuth endpoint did not respond within the preflight timeout",
+    "oauth_tls": "TLS verification failed for the OAuth endpoint",
+    "oauth_invalid_response": "the OAuth endpoint did not return a valid token response",
+    "oauth_expired_token": "the OAuth endpoint returned an expired token",
+}
+
+
+async def check_gigachat_oauth(settings: Settings) -> None:
+    try:
+        verify = gigachat_tls_context(settings.gigachat_ca_bundle)
+    except (OSError, ValueError):
+        raise ValueError("gigachat_ca_invalid") from None
+    timeout = min(10, settings.generation_timeout)
+    async with httpx.AsyncClient(
+        verify=verify, trust_env=False, follow_redirects=False,
+        timeout=httpx.Timeout(timeout, connect=5),
+    ) as client:
+        auth = GigaChatExtraction(
+            client, settings.gigachat_credentials, settings.gigachat_model, "schema",
+            scope=settings.gigachat_scope,
+        )
+        try:
+            await auth.headers(timeout=timeout)
+        except GatewayError as exc:
+            code = str(exc)
+            if code not in GIGACHAT_PREFLIGHT_ERRORS and not re.fullmatch(
+                r"oauth_http_[1-5][0-9]{2}", code,
+            ):
+                code = "oauth_invalid_response"
+            raise ValueError(code) from None
 
 
 def load_dataset() -> tuple[dict[str, Any], str]:
@@ -99,6 +138,12 @@ def safe_report(args: argparse.Namespace) -> dict[str, Any]:
         local_tracking_url(args.mlflow_uri, allow_docker_host=True)
     live = args.mode == "live"
     live_retrieval = args.retrieval == "qdrant"
+    live_gigachat = live and args.provider == "gigachat"
+    preflight_only = getattr(args, "preflight_only", False)
+    if preflight_only and not live_gigachat:
+        raise ValueError("gigachat_preflight_requires_live")
+    if live_gigachat and not args.dry_run and not args.allow_synthetic_cloud:
+        raise ValueError("synthetic_cloud_consent_required")
     settings = isolated_settings(args.provider, live=live, live_retrieval=live_retrieval)
     metadata: dict[str, Any] = {
         "dataset_version": dataset["version"], "dataset_hash": dataset_hash,
@@ -120,6 +165,10 @@ def safe_report(args: argparse.Namespace) -> dict[str, Any]:
     }
     if args.dry_run:
         return {**metadata, "state": "configuration_checked"}
+    if live_gigachat:
+        run(check_gigachat_oauth(settings))
+        if preflight_only:
+            return {**metadata, "state": "gigachat_oauth_checked"}
     previous = json.loads(args.compare.read_text(encoding="utf-8")) if args.compare else None
     rows = evaluate(
         dataset, args.provider, live=live, live_retrieval=live_retrieval,
@@ -197,7 +246,9 @@ def print_summary(report: dict[str, Any]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dry-run", action="store_true")
+    checks = parser.add_mutually_exclusive_group()
+    checks.add_argument("--dry-run", action="store_true")
+    checks.add_argument("--preflight-only", action="store_true", help="Check live GigaChat OAuth")
     parser.add_argument("--mode", choices=["offline", "live"], default="offline")
     parser.add_argument("--provider", choices=["ollama", "gigachat"], required=True)
     parser.add_argument("--retrieval", choices=["fixed", "qdrant"], default="fixed")
@@ -216,11 +267,11 @@ def main() -> int:
         and not args.allow_synthetic_cloud
     ):
         parser.error("live GigaChat requires --allow-synthetic-cloud")
-    if not args.dry_run and args.output is None:
+    if not (args.dry_run or args.preflight_only) and args.output is None:
         parser.error("--output is required for an evaluation run")
     try:
         report = safe_report(args)
-        if args.dry_run:
+        if args.dry_run or args.preflight_only:
             print(json.dumps(report, ensure_ascii=False))
             return 0
         contents = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
@@ -238,8 +289,17 @@ def main() -> int:
             "selected_provider_unavailable", "invalid_dataset_cases", "invalid_dataset_sources",
             "invalid_dataset_relevance", "invalid_mlflow_uri", "synthetic_cloud_consent_required",
             "invalid_dataset_hidden_source", "unknown_evaluation_case",
+            "gigachat_preflight_requires_live",
         }
-        print(f"Evaluation blocked: {code if code in known else type(exc).__name__}")
+        if code in GIGACHAT_PREFLIGHT_ERRORS:
+            print(f"Evaluation blocked: {code}. {GIGACHAT_PREFLIGHT_ERRORS[code]}")
+        elif re.fullmatch(r"oauth_http_[1-5][0-9]{2}", code):
+            hint = ("Check the GigaChat authorization key and scope."
+                    if code in {"oauth_http_400", "oauth_http_401", "oauth_http_403"}
+                    else "The OAuth endpoint returned an unsuccessful HTTP status.")
+            print(f"Evaluation blocked: {code}. {hint}")
+        else:
+            print(f"Evaluation blocked: {code if code in known else type(exc).__name__}")
         return 2
     return int(
         not report["complete"] or report["summary"]["security"]["failed"] > 0

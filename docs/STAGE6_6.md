@@ -63,23 +63,38 @@ live для сопоставимости. Персональный поиск п
 ## Запуск без пересборки
 
 Из корня проекта в Git Bash. Нужны уже имеющиеся образы из тестового стека
-RAG. Используйте своё имя существующего **синтетического** Compose-проекта.
+RAG и работающие сервисы синтетического проекта. Команды ниже используют
+`medical-ai-rag-local-tests` и существующую сеть Ollama
+`medical-ai-rag-inference-test` из [HYBRID_RAG.md](HYBRID_RAG.md).
+Для live-override нужен Docker Compose 2.33.1 или новее с поддержкой
+`gw_priority` в Docker Engine.
 
 ```bash
+rag_test_project=medical-ai-rag-local-tests
 rt() {
-  COMPOSE_DISABLE_ENV_FILE=1 MSYS_NO_PATHCONV=1 docker compose \
-    -p medical-ai-knowledge-test -f infrastructure/compose.rag-test.yaml "$@"
+  COMPOSE_DISABLE_ENV_FILE=1 COMPOSE_PROFILES= MSYS_NO_PATHCONV=1 \
+    MSYS2_ARG_CONV_EXCL='*' MSYS2_ENV_CONV_EXCL='GIGACHAT_CA_BUNDLE;GIGACHAT_CREDENTIALS' \
+    docker compose -p "$rag_test_project" -f infrastructure/compose.rag-test.yaml \
+    -f infrastructure/compose.rag-test-local-model.yaml "$@"
+}
+rt_live() {
+  rt -f infrastructure/compose.rag-test-live-evaluation.yaml "$@"
 }
 backend_src=$(cygpath -am "$PWD/backend")
 mkdir -p evaluation-reports
 report_dir=$(cygpath -am "$PWD/evaluation-reports")
-rt_run() {
-  rt run --rm --no-deps --pull never \
+rt_container() {
+  local compose_cmd=$1
+  shift
+  "$compose_cmd" run --rm --no-deps --pull never \
     -v "$backend_src/app:/app/app:ro" -v "$backend_src/tests:/app/tests:ro" \
     -v "$backend_src/evaluation:/app/evaluation:ro" \
     -v "$backend_src/scripts:/app/scripts:ro" \
     -v "$backend_src/alembic:/app/alembic:ro" -v "$backend_src/alembic.ini:/app/alembic.ini:ro" \
-    -v "$report_dir:/reports" tests "$@"
+    -v "$report_dir:/reports" "$@"
+}
+rt_run() {
+  rt_container rt tests "$@"
 }
 rt_run python -m pytest -q tests/test_chat_benchmark.py
 rt_run ruff check evaluation/chat_metrics.py evaluation/chat_fixtures.py \
@@ -115,10 +130,10 @@ rt_run python -m scripts.evaluate_chat --mode offline --provider ollama \
   --output /reports/offline-qdrant.json --csv /reports/offline-qdrant.csv
 ```
 
-Для live Ollama используйте существующий запущенный Ollama с
-`qwen2.5:7b-instruct`. Пример ниже использует Windows Ollama для генерации.
-С `--retrieval qdrant` нужны уже работающие тестовые Qdrant и Docker Ollama
-с моделью эмбеддингов из настроек стенда, по умолчанию `bge-m3:567m`.
+Для live Ollama используйте существующую Ollama по адресу
+`http://ollama:11434` и модель `qwen2.5:7b-instruct`. Для retrieval через
+Qdrant нужны запущенный тестовый Qdrant и модель `bge-m3:567m` в Ollama.
+Обе команды `rt_run` для offline и live Ollama используют внутренние сети.
 
 Для диагностики передайте `--case ИДЕНТИФИКАТОР` для каждого нужного сценария.
 CLI печатает статус и длительность после каждого сценария. В JSON поле
@@ -129,38 +144,93 @@ CLI печатает статус и длительность после каж�
 к провайдеру и отмену по общему дедлайну. Если при истечении срока ещё выполнялся
 инструмент, отчёт включает `timed_out_tool`. Для ошибок валидации
 `argument_issues` содержит имена известных параметров и типы ошибок.
+В каждом раунде `offered_tools` перечисляет доступные модели инструменты,
+а `tools` — вызовы, полученные от модели. Для GigaChat `finish_reason`
+показывает способ завершения потока. `missing_tools` на уровне сценария
+перечисляет ожидавшиеся инструменты, которые Agent Loop не выполнил.
 Диагностика исключает содержимое сообщений и значения параметров.
 Укажите `--retrieval fixed` в обоих прогонах, если задача только сравнить
 генерацию на тех же фиксированных источниках.
 
 ```bash
-rt_run env LLM_OLLAMA_URL=http://host.docker.internal:11434 \
+rt_run env LLM_OLLAMA_URL=http://ollama:11434 \
   python -m scripts.evaluate_chat --mode live --provider ollama --retrieval qdrant \
   --commit "$revision" --output /reports/ollama-live.json --csv /reports/ollama-live.csv
 ```
 
 Выбор live GigaChat и `--allow-synthetic-cloud` означает согласие на
-отправку только подготовленных синтетических сообщений. При недоступности
-GigaChat прогон прекращается, неполный отчёт исключается из сравнения.
+отправку только подготовленных синтетических сообщений. Live-override
+назначает исходящий шлюз только контейнеру `tests` и сохраняет доступ к
+изолированным PostgreSQL, Redis, Qdrant и Ollama. Compose монтирует
+`infrastructure/certs/gigachat/russian_trusted_root_ca_pem.crt` read-only и
+сам задаёт `GIGACHAT_CA_BUNDLE`. Модель по умолчанию `GigaChat-3-Ultra`,
+scope — `GIGACHAT_API_PERS`.
 
 ```bash
-read -rsp 'Ключ авторизации GigaChat: ' GIGACHAT_CREDENTIALS; printf '\n'
-export GIGACHAT_CREDENTIALS
-MSYS2_ENV_CONV_EXCL=GIGACHAT_CA_BUNDLE rt run --rm --no-deps --pull never \
-  -e GIGACHAT_CREDENTIALS \
-  -v "$backend_src/app:/app/app:ro" \
-  -v "$backend_src/evaluation:/app/evaluation:ro" \
-  -v "$backend_src/scripts:/app/scripts:ro" \
-  -v "$report_dir:/reports" tests \
-  python -m scripts.evaluate_chat --mode live --provider gigachat --allow-synthetic-cloud \
-  --retrieval qdrant --commit "$revision" --output /reports/gigachat-live.json \
-  --csv /reports/gigachat-live.csv --compare /reports/ollama-live.json
-unset GIGACHAT_CREDENTIALS
+rt_gigachat() (
+  set +x
+  : "${revision:?Укажите commit проверяемого кода в переменной revision}"
+  read -rsp 'Ключ авторизации GigaChat: ' GIGACHAT_CREDENTIALS || return 1
+  printf '\n'
+  export GIGACHAT_CREDENTIALS
+  rt_container rt_live -e GIGACHAT_CREDENTIALS tests python -m scripts.evaluate_chat \
+    --mode live --provider gigachat --allow-synthetic-cloud --retrieval qdrant \
+    --commit "$revision" "$@"
+)
+
+rt_gigachat --output /reports/gigachat-live.json --csv /reports/gigachat-live.csv
 ```
 
-Если в GigaChat нужен собственный PEM, перед аргументом `tests` подключите
-его read-only и передайте `-e GIGACHAT_CA_BUNDLE=/run/gigachat-ca/root.crt`.
-Модель по умолчанию `GigaChat-3-Ultra`, scope — `GIGACHAT_API_PERS`.
+Ключ считывается без отображения и живёт в окружении временного контейнера и
+подоболочки на время запуска. CLI перед сценариями проверяет локальный PEM
+и получает токен через штатный OAuth с TLS и лимитом 10 секунд. При сбое
+CLI возвращает код ошибки до выполнения сценариев. Для проверки только OAuth
+запустите `rt_gigachat --preflight-only`. Ожидается
+`"state": "gigachat_oauth_checked"`. `--dry-run` проверяет локальные настройки
+и не обращается в сеть.
+
+### Проверка изоляции
+
+```bash
+for compose_cmd in rt rt_live; do
+  "$compose_cmd" config --format json | python -c '
+import json, sys
+config = json.load(sys.stdin)
+live = sys.argv[1] == "rt_live"
+networks = config["networks"]
+services = config["services"]
+assert networks["default"]["internal"] is True
+assert networks["inference"]["name"] == "medical-ai-rag-inference-test"
+assert set(networks) == ({"default", "inference", "evaluation_egress"}
+                         if live else {"default", "inference"})
+assert all(set(services[n]["networks"]) == {"default"} and not services[n].get("ports")
+           for n in ("postgres", "redis", "qdrant"))
+with_egress = [n for n, service in services.items()
+               if "evaluation_egress" in service.get("networks", {})]
+assert with_egress == (["tests"] if live else [])
+assert set(services["tests"]["networks"]) == set(networks)
+if live:
+    assert services["tests"]["networks"]["evaluation_egress"]["gw_priority"] == 1
+    assert not networks["evaluation_egress"].get("internal", False)
+    env = services["tests"]["environment"]
+    assert "GIGACHAT_CREDENTIALS" not in env
+    assert any(v["target"] == env["GIGACHAT_CA_BUNDLE"] and v.get("read_only")
+               for v in services["tests"]["volumes"])
+print(sys.argv[1], "isolation OK")
+' "$compose_cmd" || break
+done
+
+docker network inspect --format '{{.Name}} Internal={{.Internal}}' \
+  "${rag_test_project}_default" medical-ai-rag-inference-test
+# После rt_gigachat --preflight-only:
+docker network inspect --format '{{.Name}} Internal={{.Internal}}' \
+  "${rag_test_project}_evaluation_egress"
+```
+
+Ожидаются `isolation OK` для обеих конфигураций, `Internal=true` для двух
+тестовых сетей и `Internal=false` для отдельной egress-сети. PostgreSQL,
+Redis и Qdrant подключены только к внутренней тестовой сети. Сети основного
+приложения отсутствуют в конфигурации.
 
 ## MLflow
 

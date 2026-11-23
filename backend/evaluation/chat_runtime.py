@@ -6,6 +6,7 @@ from asyncio import CancelledError
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from contextlib import ExitStack, aclosing
 from os import environ
+from pathlib import Path
 from time import perf_counter
 from typing import Any
 from unittest.mock import patch
@@ -43,6 +44,7 @@ from evaluation.chat_metrics import (
 )
 
 CHAT_LOG = logging.getLogger("uvicorn.error").getChild("chat")
+GIGACHAT_LOG = logging.getLogger("uvicorn.error").getChild("gigachat")
 SAFE_ERRORS = {
     "agent_context_limit", "agent_data_unavailable", "agent_no_answer", "agent_round_limit",
     "agent_repeated_tool", "agent_sources_missing", "agent_tool_limit",
@@ -118,6 +120,11 @@ class Trace(logging.Handler):
             self.fallback = safe_code(record.args[1])
             if self.fallback == "timeout":
                 self.note_tool_timeout()
+        elif record.msg.startswith("gigachat_stream_done ") and self.llm_requests:
+            reason = record.args[1]
+            self.llm_requests[-1]["finish_reason"] = (
+                reason if reason in {"stop", "length", "function_call"} else "other"
+            )
 
     def note_tool_timeout(self) -> None:
         if (active_tool := self.active_tool) and self.timed_out_tool is None:
@@ -179,6 +186,7 @@ class ObservedProvider:
         request: dict[str, Any] = {
             "phase": phase, "round": None if self.fallback else self.trace.round,
             "context_bytes": len(context.encode()),
+            "offered_tools": [tool["function"]["name"] for tool in tools or []],
             "tools": [], "received_text": False, "first_event_ms": None, "error": None,
         }
         self.trace.llm_requests.append(request)
@@ -247,7 +255,14 @@ def isolated_settings(provider: str, *, live: bool, live_retrieval: bool) -> Set
         **({"gigachat_credentials": SecretStr("offline-fixture"), "gigachat_ca_bundle": ""}
            if not live else {}),
     })
-    if provider_status(settings, settings.llm_provider) != "ready":
+    if live and provider == "gigachat":
+        if not settings.gigachat_credentials.get_secret_value().strip():
+            raise ValueError("gigachat_credentials_missing")
+        if not settings.gigachat_ca_bundle or not Path(settings.gigachat_ca_bundle).is_file():
+            raise ValueError("gigachat_ca_missing")
+        if provider_status(settings, "gigachat") != "ready":
+            raise ValueError("gigachat_ca_invalid")
+    elif provider_status(settings, settings.llm_provider) != "ready":
         raise ValueError("selected_provider_unavailable")
     return settings
 
@@ -434,6 +449,11 @@ def evaluate_case(
         )))
         CHAT_LOG.addHandler(trace)
         stack.callback(CHAT_LOG.removeHandler, trace)
+        if live_call and settings.llm_provider == "gigachat":
+            stack.callback(GIGACHAT_LOG.setLevel, GIGACHAT_LOG.level)
+            GIGACHAT_LOG.setLevel(logging.INFO)
+            GIGACHAT_LOG.addHandler(trace)
+            stack.callback(GIGACHAT_LOG.removeHandler, trace)
         created = client.post("/chat", headers=headers(client))
         created.raise_for_status()
         path = f"/chat/{created.json()['id']}"
@@ -488,6 +508,7 @@ def evaluate_case(
     row = {
         "id": case["id"], "answer": score_answer(case, answer, sources, aliases, error),
         "routing_ok": expected == actual,
+        "missing_tools": sorted(expected - actual),
         "mixed": {"search_pubmed", "search_medical_knowledge"} <= expected,
         "extra_pubmed": "search_pubmed" in actual - expected,
         "tools": trace.tools, "fallback": trace.fallback,
