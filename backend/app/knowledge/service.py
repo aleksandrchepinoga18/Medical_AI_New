@@ -16,6 +16,7 @@ from app.documents.validation import inspect_upload
 from app.integrations.object_storage import StorageError
 from app.knowledge.models import KnowledgeAdmin, MedicalChunk, MedicalSource, MedicalVersion
 from app.knowledge.schemas import (
+    PubMedCitation,
     ReviewPublishRequest,
     SourceMetadata,
     SourceUpload,
@@ -36,22 +37,23 @@ TRANSITIONS = {
 }
 
 
-def source_snapshot(source: MedicalSource, version: MedicalVersion) -> dict[str, Any]:
-    return {
+def source_snapshot(source: MedicalSource, version: MedicalVersion | None) -> dict[str, Any]:
+    result = {
         "id": source.id,
         **{name: getattr(source, name) for name in SourceMetadata.model_fields},
-        "current_version": VersionView.model_validate(version),
+        "current_version": VersionView.model_validate(version) if version else None,
         "verification_status": (
-            "rejected" if version.status == "rejected"
-            else "verified" if version.reviewed_by else "pending"
+            "rejected" if version and version.status == "rejected"
+            else "verified" if version and version.reviewed_by else "pending"
         ),
-        "freshness_status": "outdated" if version.status == "outdated" else "current",
+        "freshness_status": "outdated" if version and version.status == "outdated" else "current",
     }
+    if source.pubmed_citation is not None:
+        result["pubmed_citation"] = source.pubmed_citation
+    return result
 
 
-def source_and_version(
-    db: Session, source_id: UUID, expected_version: UUID | None = None,
-) -> tuple[MedicalSource, MedicalVersion]:
+def lock_source(db: Session, source_id: UUID) -> tuple[MedicalSource, MedicalVersion | None]:
     source = db.scalar(
         select(MedicalSource).where(MedicalSource.id == source_id).with_for_update(),
     )
@@ -60,14 +62,22 @@ def source_and_version(
     version = db.scalar(select(MedicalVersion).where(
         MedicalVersion.source_id == source.id, MedicalVersion.is_current,
     ))
-    assert version is not None
+    return source, version
+
+
+def source_and_version(
+    db: Session, source_id: UUID, expected_version: UUID | None = None,
+) -> tuple[MedicalSource, MedicalVersion]:
+    source, version = lock_source(db, source_id)
+    if version is None:
+        raise HTTPException(409, "Medical source has no original")
     if expected_version is not None and version.id != expected_version:
         raise HTTPException(409, "Medical source version changed")
     return source, version
 
 
 def metadata_values(data: SourceMetadata) -> dict[str, Any]:
-    return {**data.model_dump(exclude={"version"}), "url": str(data.url)}
+    return {**data.model_dump(exclude={"version", "rights_confirmed"}), "url": str(data.url)}
 
 
 def flush_identity(db: Session) -> None:
@@ -85,6 +95,26 @@ def reject_personal_original(db: Session, sha256: str) -> None:
         raise HTTPException(409, "Original is ineligible for the medical corpus")
 
 
+def save_pubmed_citation(db: Session, citation: PubMedCitation) -> dict[str, Any]:
+    doi = citation.doi if citation.doi and len(citation.doi) <= 255 else None
+    source = MedicalSource(
+        title=citation.title[:500], material_type="PubMed",
+        author=(", ".join(citation.authors) or "Не указаны")[:300],
+        publisher=(citation.journal or "Не указан")[:300],
+        url=citation.url, doi=doi, pmid=citation.pmid,
+        publication_date=citation.publication_date,
+        specialty="Не указано", language=citation.language or "und", jurisdiction="Не указана",
+        pubmed_citation=citation.model_dump(
+            mode="json", include=set(PubMedCitation.model_fields),
+        ),
+    )
+    db.add(source)
+    flush_identity(db)
+    result = source_snapshot(source, None)
+    db.commit()
+    return result
+
+
 def store_version(
     db: Session,
     storage: KnowledgeStorage,
@@ -95,21 +125,25 @@ def store_version(
     filename: str,
     source_id: UUID | None = None,
 ) -> dict[str, Any]:
+    values = metadata_values(data)
     upload = inspect_upload(file, filename, settings)
     reject_personal_original(db, upload.sha256)
-    values = metadata_values(data)
     if source_id is None:
         source = MedicalSource(**values)
         db.add(source)
     else:
-        source, old = source_and_version(db, source_id)
-        if old.version == data.version and old.sha256 == upload.sha256 and all(
-            getattr(source, key) == value for key, value in values.items()
-        ):
-            return source_snapshot(source, old)
-        old.is_current = False
-        if old.status != "rejected":
-            old.status = "outdated"
+        source, old = lock_source(db, source_id)
+        if source.pubmed_citation is not None and not data.rights_confirmed:
+            raise HTTPException(422, "PubMed original requires rights confirmation")
+        require_same_pubmed_identity(source, values)
+        if old is not None:
+            if old.version == data.version and old.sha256 == upload.sha256 and all(
+                getattr(source, key) == value for key, value in values.items()
+            ):
+                return source_snapshot(source, old)
+            old.is_current = False
+            if old.status != "rejected":
+                old.status = "outdated"
         for key, value in values.items():
             setattr(source, key, value)
     flush_identity(db)
@@ -131,17 +165,26 @@ def store_version(
     return result
 
 
+def require_same_pubmed_identity(source: MedicalSource, values: dict[str, Any]) -> None:
+    if source.pubmed_citation is not None and any(
+        getattr(source, field) != values[field] for field in ("pmid", "doi", "url")
+    ):
+        raise HTTPException(422, "PubMed identifiers and official URL are fixed")
+
+
 def update_metadata(
     db: Session, source_id: UUID, data: SourceMetadata,
 ) -> dict[str, Any]:
-    source, version = source_and_version(db, source_id)
+    source, version = lock_source(db, source_id)
     values = metadata_values(data)
+    require_same_pubmed_identity(source, values)
     if any(getattr(source, key) != value for key, value in values.items()):
         for key, value in values.items():
             setattr(source, key, value)
-        version.status = "uploaded"
-        version.review_revision = uuid4()
-        version.reviewed_by = version.reviewed_at = version.review_note = None
+        if version:
+            version.status = "uploaded"
+            version.review_revision = uuid4()
+            version.reviewed_by = version.reviewed_at = version.review_note = None
         flush_identity(db)
     result = source_snapshot(source, version)
     db.commit()

@@ -7,10 +7,11 @@ import { Card, CardContent, CardHeader } from "../ui/card";
 import { Input } from "../ui/input";
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from "../ui/sheet";
 import {
-  editSource, KnowledgeApiError, listSources, reviewPublish, searchKnowledge, setSourceStatus,
-  sourceOriginalUrl, uploadSource, type Locator, type SearchHit, type Source, type SourceMetadata,
-  type SourceStatus,
+  editSource, KnowledgeApiError, listSources, reviewPublish, savePubMed, searchKnowledge,
+  setSourceStatus, sourceOriginalUrl, uploadSource, type CitationSource, type Locator,
+  type RegistrySource, type SearchHit, type Source, type SourceMetadata, type SourceStatus,
 } from "../../lib/knowledge-api";
+import { PubMedBibliography, PubMedPanel } from "./pubmed";
 
 const statuses: Record<SourceStatus, string> = {
   uploaded: "Загружен", verified: "Проверен", published: "Опубликован",
@@ -27,8 +28,8 @@ const optional = [
   ["publication_date", "Дата публикации", "date", undefined],
   ["update_date", "Дата обновления", "date", undefined],
 ] as const;
-type Editor = { kind: "create" } | { kind: "metadata" | "version"; source: Source };
-type Mutation = (work: () => Promise<Source>, message: string) => void;
+type Editor = { kind: "create" } | { kind: "metadata" | "version"; source: RegistrySource };
+type Mutation = (work: () => Promise<RegistrySource>, message: string) => void;
 
 function officialLink(url: string) {
   return /^https:\/\//i.test(url)
@@ -58,23 +59,29 @@ function SourceEditor({ editor, busy, mutate, cancel }: {
       if (!file?.size || !/\.(pdf|docx)$/i.test(file.name)) {
         throw new Error("Выберите PDF или DOCX.");
       }
-      return uploadSource({ ...metadata, version: value("version") }, file, source?.id);
+      const rights = source?.pubmed_citation
+        ? { rights_confirmed: form.has("rights_confirmed") }
+        : {};
+      return uploadSource({ ...metadata, version: value("version"), ...rights }, file, source?.id);
     }, "Оригинал загружен. Материал ожидает проверки.");
   }
   return <Card><CardHeader>
     <h2 className="font-semibold">{editor.kind === "create" ? "Новый источник"
-      : editor.kind === "version" ? "Новая версия" : "Метаданные источника"}</h2>
+      : editor.kind === "metadata" ? "Метаданные источника"
+      : source?.current_version ? "Новая версия" : "Загрузка оригинала"}</h2>
   </CardHeader><CardContent>
     <form onSubmit={submit}>
       <fieldset disabled={busy} className="grid gap-4 sm:grid-cols-2">
         {fields.map(([key, label, max]) => <label key={key} className="space-y-1 text-sm">
           <span>{label}</span>
           <Input name={key} required maxLength={max} type={key === "url" ? "url" : "text"}
+            readOnly={Boolean(source?.pubmed_citation) && key === "url"}
             defaultValue={source?.[key]} />
         </label>)}
         {optional.map(([key, label, type, max]) => <label key={key} className="space-y-1 text-sm">
           <span>{label}</span>
-          <Input name={key} type={type} maxLength={max} defaultValue={source?.[key] ?? ""} />
+          <Input name={key} type={type} maxLength={max} defaultValue={source?.[key] ?? ""}
+            readOnly={Boolean(source?.pubmed_citation) && (key === "doi" || key === "pmid")} />
         </label>)}
         {editor.kind !== "metadata" && <>
           <label className="space-y-1 text-sm"><span>Версия</span>
@@ -84,8 +91,12 @@ function SourceEditor({ editor, busy, mutate, cancel }: {
             <Input name="file" type="file" required accept=".pdf,.docx"
               onChange={event => setFile(event.target.files?.[0] ?? null)} />
           </label>
+          {source?.pubmed_citation && <label className="flex items-start gap-2 text-sm sm:col-span-2">
+            <input type="checkbox" className="mt-0.5" name="rights_confirmed" required />
+            Я проверил лицензию или получил разрешение на загрузку и использование полного текста.
+          </label>}
         </>}
-        {source && <p className="text-sm text-muted-foreground sm:col-span-2">
+        {source?.current_version && <p className="text-sm text-muted-foreground sm:col-span-2">
           Изменение метаданных или версии потребует повторной проверки и публикации.
         </p>}
         <div className="flex gap-2 sm:col-span-2">
@@ -101,6 +112,32 @@ function DownloadOriginal({ source }: { source: Source }) {
   return <Button asChild variant="outline" size="sm">
     <a href={sourceOriginalUrl(source)} target="_blank" rel="noreferrer">Скачать оригинал</a>
   </Button>;
+}
+
+function CitationCard({ source, busy, edit }: {
+  source: CitationSource; busy: boolean; edit: (editor: Editor) => void;
+}) {
+  const title = source.pubmed_citation.title;
+  return <Card>
+    <CardHeader>
+      <div className="flex flex-wrap items-center gap-3">
+        <h3 className="break-words font-semibold">{source.title === title.slice(0, 500) ? title : source.title}</h3>
+        <Badge>Библиография · Без оригинала</Badge>
+      </div>
+    </CardHeader>
+    <CardContent className="space-y-4 text-sm">
+      <PubMedBibliography citation={source.pubmed_citation} />
+      {officialLink(source.url)}
+      <div className="flex flex-wrap gap-2">
+        <Button size="sm" variant="outline" disabled={busy} onClick={() => edit({ kind: "metadata", source })}>
+          Изменить метаданные
+        </Button>
+        <Button size="sm" disabled={busy} onClick={() => edit({ kind: "version", source })}>
+          Загрузить оригинал
+        </Button>
+      </div>
+    </CardContent>
+  </Card>;
 }
 
 function SourceCard({ source, busy, processing, failure, selected, select, confirm, mutate, edit }: {
@@ -152,6 +189,9 @@ function SourceCard({ source, busy, processing, failure, selected, select, confi
         <p className="mt-2">Статус реестра · {statuses[version.status]} · Чанков {version.chunk_count}</p>
         <p className="mt-2 break-all">SHA-256 <code>{version.sha256}</code></p>
         {version.review_note && <p>Проверка · {version.review_note}</p>}
+        {source.pubmed_citation && <div className="mt-4">
+          <PubMedBibliography citation={source.pubmed_citation} />
+        </div>}
       </details>
     </CardContent>
   </Card>;
@@ -235,7 +275,8 @@ function SearchPanel({ onAccessLost }: { onAccessLost: (failure: KnowledgeApiErr
 }
 
 export function KnowledgeAdmin() {
-  const [sources, setSources] = useState<Source[]>([]);
+  const [sources, setSources] = useState<RegistrySource[]>([]);
+  const [tab, setTab] = useState<"registry" | "pubmed">("registry");
   const [after, setAfter] = useState<string | null>(null);
   const [editor, setEditor] = useState<Editor | null>(null);
   const [busy, setBusy] = useState(true);
@@ -248,8 +289,9 @@ export function KnowledgeAdmin() {
   const [review, setReview] = useState<Source[]>([]);
   const [processing, setProcessing] = useState<string | null>(null);
   const [failures, setFailures] = useState<Record<string, string>>({});
-  const selectedSources = sources.filter(source => source.current_version.status !== "published"
-    && selected.has(revisionKey(source)));
+  const selectedSources = sources.filter((source): source is Source => source.current_version !== null
+    && source.current_version.status !== "published" && selected.has(revisionKey(source)));
+  const savedPmids = new Set(sources.flatMap(source => source.pmid ? [source.pmid] : []));
   const showError = useCallback((failure: unknown) => {
     setError(failure instanceof Error ? failure.message : "Операция не завершена.");
     if (failure instanceof KnowledgeApiError && [401, 403].includes(failure.status)) setAccessLost(true);
@@ -291,11 +333,11 @@ export function KnowledgeAdmin() {
       }
     });
   }
-  function saveSource(source: Source) {
+  function saveSource(source: RegistrySource) {
     setSources(current => current.some(item => item.id === source.id)
       ? current.map(item => item.id === source.id ? source : item) : [source, ...current]);
   }
-  function mutate(work: () => Promise<Source>, done: string) {
+  function mutate(work: () => Promise<RegistrySource>, done: string) {
     return perform(async () => {
       saveSource(await work());
       setEditor(null);
@@ -349,33 +391,61 @@ export function KnowledgeAdmin() {
     {message && <p role="status" className="text-sm text-emerald-700">{message}</p>}
     {busy && <p role="status" className="text-sm text-muted-foreground">Операция выполняется…</p>}
     {!accessLost && <>
-      <section aria-label="Реестр источников" className="space-y-4">
-        <div className="flex flex-wrap items-center gap-2">
-          <h2 className="mr-auto text-xl font-semibold">Реестр источников</h2>
-          <Button variant="outline" disabled={busy} onClick={() => load(false)}>Обновить реестр</Button>
-          <Button disabled={busy} onClick={() => setEditor({ kind: "create" })}>Добавить источник</Button>
-        </div>
-        {selectedSources.length > 0 && <div className="flex flex-wrap items-center gap-3">
-          <span className="text-sm text-muted-foreground">Выбрано: {selectedSources.length}</span>
-          <Button disabled={busy} onClick={() => setReview(selectedSources)}>
-            Подтвердить и опубликовать выбранные
-          </Button>
-          <Button variant="ghost" disabled={busy} onClick={() => setSelected(new Set())}>Снять выделение</Button>
-        </div>}
-        {editor && <SourceEditor key={editor.kind + ("source" in editor ? editor.source.id : "")}
-          editor={editor} busy={busy} mutate={mutate} cancel={() => setEditor(null)} />}
-        {!sources.length && !busy && !error && <p className="text-muted-foreground">Источников пока нет.</p>}
-        {sources.map(source => <SourceCard key={source.current_version.id} source={source}
-          busy={busy} mutate={mutate} edit={setEditor}
-          processing={processing === revisionKey(source)}
-          failure={source.current_version.status === "published" ? undefined : failures[revisionKey(source)]}
-          selected={selected.has(revisionKey(source))}
-          select={() => select(source, !selected.has(revisionKey(source)))}
-          confirm={() => setReview([source])} />)}
-        {after && <Button variant="outline" disabled={busy} onClick={() => load(true)}>Показать ещё</Button>}
-      </section>
-      <ReviewSheet sources={review} cancel={() => setReview([])} publish={confirmReview} />
-      {registryReady && <SearchPanel key={searchRevision} onAccessLost={showError} />}
+      <div role="tablist" aria-label="Медицинская база знаний" className="flex flex-wrap gap-2">
+        {(["registry", "pubmed"] as const).map((name, index, tabs) =>
+          <Button key={name} id={`knowledge-tab-${name}`} type="button" role="tab"
+            aria-selected={tab === name} aria-controls={`knowledge-panel-${name}`}
+            tabIndex={tab === name ? 0 : -1} variant={tab === name ? "default" : "outline"}
+            onClick={() => setTab(name)} onKeyDown={event => {
+              const next = event.key === "Home" ? tabs[0] : event.key === "End" ? tabs[1]
+                : ["ArrowLeft", "ArrowRight"].includes(event.key) ? tabs[1 - index] : undefined;
+              if (next) {
+                event.preventDefault();
+                setTab(next);
+                document.getElementById(`knowledge-tab-${next}`)?.focus();
+              }
+            }}>
+            {name === "registry" ? "Реестр источников" : "Поиск PubMed"}
+          </Button>)}
+      </div>
+      <div role="tabpanel" id="knowledge-panel-registry" aria-labelledby="knowledge-tab-registry"
+        hidden={tab !== "registry"} className="space-y-6">
+        <section aria-label="Реестр источников" className="space-y-4">
+          <div className="flex flex-wrap items-center gap-2">
+            <Button className="ml-auto" variant="outline" disabled={busy} onClick={() => load(false)}>
+              Обновить реестр
+            </Button>
+            <Button disabled={busy} onClick={() => setEditor({ kind: "create" })}>Добавить источник</Button>
+          </div>
+          {selectedSources.length > 0 && <div className="flex flex-wrap items-center gap-3">
+            <span className="text-sm text-muted-foreground">Выбрано: {selectedSources.length}</span>
+            <Button disabled={busy} onClick={() => setReview(selectedSources)}>
+              Подтвердить и опубликовать выбранные
+            </Button>
+            <Button variant="ghost" disabled={busy} onClick={() => setSelected(new Set())}>Снять выделение</Button>
+          </div>}
+          {editor && <SourceEditor key={editor.kind + ("source" in editor ? editor.source.id : "")}
+            editor={editor} busy={busy} mutate={mutate} cancel={() => setEditor(null)} />}
+          {!sources.length && !busy && !error && <p className="text-muted-foreground">Источников пока нет.</p>}
+          {sources.map(source => source.current_version === null
+            ? <CitationCard key={source.id} source={source} busy={busy} edit={setEditor} />
+            : <SourceCard key={source.current_version.id} source={source}
+              busy={busy} mutate={mutate} edit={setEditor}
+              processing={processing === revisionKey(source)}
+              failure={source.current_version.status === "published" ? undefined : failures[revisionKey(source)]}
+              selected={selected.has(revisionKey(source))}
+              select={() => select(source, !selected.has(revisionKey(source)))}
+              confirm={() => setReview([source])} />)}
+          {after && <Button variant="outline" disabled={busy} onClick={() => load(true)}>Показать ещё</Button>}
+        </section>
+        <ReviewSheet sources={review} cancel={() => setReview([])} publish={confirmReview} />
+        {registryReady && <SearchPanel key={searchRevision} onAccessLost={showError} />}
+      </div>
+      <div role="tabpanel" id="knowledge-panel-pubmed" aria-labelledby="knowledge-tab-pubmed"
+        hidden={tab !== "pubmed"}>
+        <PubMedPanel saving={busy} savedPmids={savedPmids} onAccessLost={showError}
+          save={pmid => mutate(() => savePubMed(pmid), "Библиография сохранена в реестре.")} />
+      </div>
     </>}
   </main>;
 }

@@ -6,11 +6,14 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import KnowledgePage from "../app/(private)/knowledge/page";
 import { AppShell } from "../components/app-shell";
 import { KnowledgeAdmin } from "../components/knowledge/admin";
-import { KnowledgeApiError, type Source, type SourceStatus } from "../lib/knowledge-api";
+import {
+  KnowledgeApiError, type CitationSource, type PubMedHit, type Source, type SourceStatus,
+} from "../lib/knowledge-api";
 
 const api = vi.hoisted(() => ({
   access: vi.fn(), listSources: vi.fn(), uploadSource: vi.fn(), editSource: vi.fn(),
   reviewPublish: vi.fn(), setSourceStatus: vi.fn(), searchKnowledge: vi.fn(),
+  savePubMed: vi.fn(), searchPubMed: vi.fn(),
 }));
 vi.mock("../lib/knowledge-access", () => ({ hasKnowledgeAccess: api.access }));
 vi.mock("../lib/knowledge-api", async original => ({
@@ -61,6 +64,48 @@ it("hides operations when the registry rejects access", async () => {
   expect(await screen.findByRole("alert")).toHaveTextContent("Synthetic denial");
   expect(screen.queryByRole("button", { name: "Добавить источник" })).toBeNull();
   expect(api.setSourceStatus).not.toHaveBeenCalled();
+});
+
+it("searches PubMed and saves a citation without making it available for publication", async () => {
+  const hit: PubMedHit = {
+    title: "Synthetic article", authors: ["Ada Example"], journal: "Synthetic journal",
+    year: 2024, publication_date: null, pmid: "12345678", doi: "10.99999/sample",
+    pmcid: "PMC12345678", language: "eng", url: "https://pubmed.ncbi.nlm.nih.gov/12345678/",
+    abstract: "Synthetic abstract",
+    full_text_url: "https://pmc.ncbi.nlm.nih.gov/articles/PMC12345678/",
+    publisher_url: null, access: "free_link_reported",
+  };
+  const saved: CitationSource = {
+    ...source(), id: "pubmed-citation", title: hit.title, pmid: hit.pmid, url: hit.url,
+    current_version: null, pubmed_citation: hit,
+  };
+  api.listSources.mockResolvedValue({ items: [], next_after: null });
+  api.searchPubMed.mockResolvedValue({ items: [hit] });
+  api.savePubMed.mockResolvedValue(saved);
+  const user = userEvent.setup();
+  render(<KnowledgeAdmin />);
+  await screen.findByText("Источников пока нет.");
+  await user.click(screen.getByRole("tab", { name: "Поиск PubMed" }));
+  await user.type(screen.getByLabelText("Медицинский запрос, PMID или DOI"), hit.pmid);
+  fireEvent.change(screen.getByLabelText("Дата публикации с"), { target: { value: "2024-01-01" } });
+  await user.click(screen.getByRole("button", { name: "Найти в PubMed" }));
+  expect(api.searchPubMed).toHaveBeenCalledWith({
+    query: hit.pmid, limit: 10, date_from: "2024-01-01", date_to: null,
+  });
+  expect(await screen.findByText("Аннотация доступна")).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Полный текст в PubMed Central" }))
+    .toHaveAttribute("href", hit.full_text_url);
+  expect(screen.getByText(/бесплатного чтения.*проверьте лицензию/)).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Сохранить в реестр" }));
+  expect(await screen.findByRole("button", { name: "Уже в реестре" })).toBeDisabled();
+  expect(api.savePubMed).toHaveBeenCalledWith(hit.pmid);
+  await user.click(screen.getByRole("tab", { name: "Реестр источников" }));
+  expect(screen.getByText("Библиография · Без оригинала")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Подтвердить и опубликовать" })).toBeNull();
+  await user.click(screen.getByRole("button", { name: "Загрузить оригинал" }));
+  expect(screen.getByRole("checkbox", { name: /Я проверил лицензию/ })).toBeRequired();
+  expect(api.uploadSource).not.toHaveBeenCalled();
+  expect(api.reviewPublish).not.toHaveBeenCalled();
 });
 
 it("uploads a synthetic PDF with bibliography", async () => {

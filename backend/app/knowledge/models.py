@@ -42,6 +42,7 @@ class MedicalSource(Base):
     specialty: Mapped[str] = mapped_column(String(150))
     language: Mapped[str] = mapped_column(String(35))
     jurisdiction: Mapped[str] = mapped_column(String(150))
+    pubmed_citation: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))
 
 
 class MedicalVersion(Base):

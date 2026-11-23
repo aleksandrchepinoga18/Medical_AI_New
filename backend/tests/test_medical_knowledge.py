@@ -16,9 +16,9 @@ from sqlalchemy.orm import Session
 from app.core.config import KNOWLEDGE_COLLECTION, Settings
 from app.documents.models import Document
 from app.integrations.object_storage import ObjectStorage
-from app.knowledge import routes
+from app.knowledge import pubmed, routes
 from app.knowledge.models import KnowledgeAdmin, MedicalChunk, MedicalSource, MedicalVersion
-from app.knowledge.schemas import SourceUpload
+from app.knowledge.schemas import PubMedHit, SourceMetadata, SourceUpload
 from app.knowledge.storage import KnowledgeStorage, knowledge_key
 from app.knowledge.vectors import KnowledgeVectors
 from app.main import app
@@ -78,6 +78,72 @@ def test_knowledge_input_and_storage_scope():
         with personal.open_original(uuid4(), uuid4(), knowledge_key(uuid4(), uuid4())):
             pytest.fail("A personal read accepted a knowledge object key")
     assert transport.response is None
+
+
+@pytest.mark.integration
+def test_pubmed_citation_is_saved_without_a_file_or_publication(environment, client, monkeypatch):
+    engine, _, _, _ = environment
+    admin_id = UUID(client.get("/auth/me").json()["id"])
+    pmid = str(uuid4().int % 10**18 + 10**18)
+    citation = PubMedHit(
+        title="Synthetic article", authors=["Synthetic author"], journal="Synthetic journal",
+        year=2024, publication_date=None, pmid=pmid, doi=f"10.99999/{pmid}",
+        pmcid=f"PMC{pmid}", language="eng", url=f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+        abstract="Synthetic abstract", full_text_url=None, publisher_url=None,
+    )
+    monkeypatch.setattr(pubmed, "lookup", lambda *_: citation)
+    monkeypatch.setattr(pubmed, "search", lambda *_: [citation])
+    transport = document_storage.FakeClient()
+    storage = KnowledgeStorage(document_storage.settings(), transport)
+    monkeypatch.setattr(routes, "get_storage", lambda: storage)
+    csrf = rag_integration.headers(client)
+    search = "/knowledge/pubmed/search"
+    save = "/knowledge/pubmed/save"
+    query, selection = {"query": "synthetic"}, {"pmid": pmid}
+    assert client.post(search, headers=csrf, json=query).status_code == 403
+    assert client.post(save, headers=csrf, json=selection).status_code == 403
+    with Session(engine) as db:
+        db.add(KnowledgeAdmin(user_id=admin_id))
+        db.commit()
+    assert client.post(save, json=selection).status_code == 403
+    result = client.post(search, headers=csrf, json=query)
+    assert result.status_code == 200
+    assert result.json()["items"][0]["abstract"] == citation.abstract
+
+    saved = client.post(save, headers=csrf, json=selection)
+    assert saved.status_code == 201, saved.text
+    row = saved.json()
+    assert row["current_version"] is None
+    assert row["verification_status"] == "pending"
+    assert row["pubmed_citation"]["pmcid"] == citation.pmcid
+    assert "abstract" not in row["pubmed_citation"]
+    assert transport.objects == {}
+    assert client.post(save, headers=csrf, json=selection).status_code == 409
+    after = None
+    while True:
+        page = client.get(REGISTRY, params={"after": after} if after else None).json()
+        if row in page["items"]:
+            break
+        after = page["next_after"]
+        assert after
+
+    path = f"{REGISTRY}/{row['id']}"
+    assert client.post(
+        f"{path}/index", headers=csrf, json={"version_id": str(uuid4())},
+    ).status_code == 409
+    metadata = {key: row[key] for key in SourceMetadata.model_fields} | {"version": "1"}
+    original = pdf(f"Synthetic article {pmid}.")
+    assert client.put(
+        f"{path}/version", headers=csrf, **multipart(metadata, original),
+    ).status_code == 422
+    assert transport.objects == {}
+    upload = client.put(
+        f"{path}/version", headers=csrf,
+        **multipart({**metadata, "rights_confirmed": True}, original),
+    )
+    assert upload.status_code == 200, upload.text
+    assert upload.json()["current_version"]["status"] == "uploaded"
+    assert upload.json()["pubmed_citation"] == row["pubmed_citation"]
 
 
 @pytest.mark.integration

@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     documents_outbox_interval: int = Field(default=5, ge=1, le=60)
     documents_outbox_enabled: bool = True
     documents_extraction_provider: Literal["pymupdf_tables", "gigachat_ultra"] = "pymupdf_tables"
+    pubmed_contact_email: str = ""
     gigachat_credentials: SecretStr = SecretStr("")
     gigachat_scope: Literal["GIGACHAT_API_PERS"] = "GIGACHAT_API_PERS"
     gigachat_model: Literal["GigaChat-3-Ultra"] = "GigaChat-3-Ultra"

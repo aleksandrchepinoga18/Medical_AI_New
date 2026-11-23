@@ -6,7 +6,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
@@ -16,10 +16,13 @@ from app.db import get_settings
 from app.documents.providers import ProcessingError
 from app.documents.routes import OriginalResponse, bounded_upload_form, require_session_cookie
 from app.integrations.object_storage import OriginalNotFound, StorageError
-from app.knowledge import service
+from app.knowledge import pubmed, service
 from app.knowledge.models import KnowledgeAdmin, MedicalSource, MedicalVersion
 from app.knowledge.schemas import (
     IndexRequest,
+    PubMedHit,
+    PubMedSearch,
+    PubMedSelection,
     ReviewPublishRequest,
     SourceMetadata,
     SourceUpload,
@@ -47,6 +50,24 @@ Config = Annotated[Settings, Depends(get_settings)]
 @router.get("/access", status_code=204, dependencies=[Depends(require_admin)])
 def access(response: Response) -> None:
     response.headers["Cache-Control"] = "no-store"
+
+
+@router.post("/pubmed/search", dependencies=[Depends(require_admin)])
+def search_pubmed(
+    data: PubMedSearch, response: Response, db: DB, settings: Config,
+) -> dict[str, list[PubMedHit]]:
+    response.headers["Cache-Control"] = "no-store"
+    db.rollback()
+    return {"items": pubmed.search(data, settings.pubmed_contact_email)}
+
+
+@router.post("/pubmed/save", status_code=201, dependencies=[Depends(require_admin)])
+def save_pubmed(
+    data: PubMedSelection, response: Response, db: DB, settings: Config,
+) -> dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    db.rollback()
+    return service.save_pubmed_citation(db, pubmed.lookup(data.pmid, settings.pubmed_contact_email))
 
 
 @lru_cache
@@ -90,8 +111,10 @@ def registry(
 ) -> dict[str, Any]:
     statement = (
         select(MedicalSource, MedicalVersion)
-        .join(MedicalVersion, MedicalVersion.source_id == MedicalSource.id)
-        .where(MedicalVersion.is_current)
+        .outerjoin(MedicalVersion, and_(
+            MedicalVersion.source_id == MedicalSource.id, MedicalVersion.is_current,
+        ))
+        .where(or_(MedicalVersion.id.is_not(None), MedicalSource.pubmed_citation.is_not(None)))
         .order_by(MedicalSource.id)
         .limit(limit + 1)
     )

@@ -60,10 +60,10 @@ def copy_original(path: Path, target: BinaryIO, maximum: int) -> None:
     target.seek(0)
 
 
-def identities(metadata: dict[str, Any], checksum: str) -> set[Identity]:
+def identities(metadata: dict[str, Any], checksum: str | None) -> set[Identity]:
     return {
         (field, str(metadata[field])) for field in IDENTIFIERS if metadata.get(field)
-    } | {("sha256", checksum)}
+    } | ({("sha256", checksum)} if checksum else set())
 
 
 def require_status(response: httpx.Response, expected: int) -> None:
@@ -101,7 +101,8 @@ class Registry:
         self.refresh()
 
     def add(self, row: dict[str, Any]) -> None:
-        for key in identities(row, row["current_version"]["sha256"]):
+        current = row["current_version"]
+        for key in identities(row, current["sha256"] if current else None):
             self.by_key.setdefault(key, []).append(row)
 
     def refresh(self) -> None:
@@ -134,7 +135,8 @@ class Registry:
             row = next(iter(matches.values()))
             current = row["current_version"]
             if (
-                current["version"] == metadata["version"] and current["sha256"] == checksum
+                current is not None
+                and current["version"] == metadata["version"] and current["sha256"] == checksum
                 and all(row.get(field) == metadata[field] for field in IDENTIFIERS
                         if metadata.get(field))
             ):
@@ -176,7 +178,7 @@ def batch(
         result: dict[str, Any] = {"item": number, "file": item.file}
         try:
             path = import_path(root, item.file)
-            metadata = item.metadata.model_dump(mode="json")
+            metadata = item.metadata.model_dump(mode="json", exclude={"rights_confirmed"})
             with SpooledTemporaryFile(max_size=1048576, mode="w+b") as original:
                 copy_original(path, original, settings.documents_max_bytes)
                 upload = inspect_upload(original, path.name, settings)

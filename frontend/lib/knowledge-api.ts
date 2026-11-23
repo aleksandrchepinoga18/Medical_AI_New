@@ -10,8 +10,26 @@ export type SourceVersion = {
   id: string; version: string; status: SourceStatus; format: string; sha256: string;
   review_revision: string; review_note: string | null; chunk_count: number;
 };
-export type Source = SourceMetadata & { id: string; current_version: SourceVersion };
-export type SourcePage = { items: Source[]; next_after: string | null };
+export type PubMedCitation = {
+  title: string; authors: string[]; journal: string | null; year: number | null;
+  publication_date: string | null; pmid: string; doi: string | null; pmcid: string | null;
+  language: string | null; url: string;
+};
+export type PubMedHit = PubMedCitation & {
+  abstract: string | null; full_text_url: string | null; publisher_url: string | null;
+  access: "free_link_reported" | "link_reported" | "unknown";
+};
+export type PubMedSearch = {
+  query: string; limit: number; date_from: string | null; date_to: string | null;
+};
+export type Source = SourceMetadata & {
+  id: string; current_version: SourceVersion; pubmed_citation?: PubMedCitation;
+};
+export type CitationSource = Omit<Source, "current_version" | "pubmed_citation"> & {
+  current_version: null; pubmed_citation: PubMedCitation;
+};
+export type RegistrySource = Source | CitationSource;
+export type SourcePage = { items: RegistrySource[]; next_after: string | null };
 export type Locator = { kind: string; index: number; start: number; end: number };
 export type SearchHit = {
   chunk_id: string; text: string; score?: number; locators: Locator[];
@@ -33,6 +51,11 @@ const errors: Record<number, string> = {
 };
 
 const detailMessages: Record<string, string> = {
+  "Invalid PubMed identifier": "Проверьте формат PMID или DOI.",
+  "PubMed temporarily unavailable": "PubMed временно недоступен. Повторите запрос позже.",
+  "PubMed publication not found": "Публикация больше не найдена в PubMed.",
+  "PubMed original requires rights confirmation": "Подтвердите право на загрузку и использование оригинала.",
+  "PubMed identifiers and official URL are fixed": "Идентификаторы и официальный URL записи PubMed закреплены.",
   "Medical source must be indexed with the current settings": "Сначала выполните индексацию.",
   "Medical source index is incomplete": "В индексе отсутствуют чанки. Повторите индексацию.",
   "Original is ineligible for the medical corpus": "Этот файл нельзя добавить в общий корпус.",
@@ -73,7 +96,7 @@ export function listSources(after?: string, signal?: AbortSignal): Promise<Sourc
 }
 
 export function uploadSource(
-  metadata: SourceMetadata & { version: string }, file: File, id?: string,
+  metadata: SourceMetadata & { version: string; rights_confirmed?: boolean }, file: File, id?: string,
 ): Promise<Source> {
   const body = new FormData();
   body.set("metadata", JSON.stringify(metadata));
@@ -88,7 +111,13 @@ function jsonRequest<T>(path: string, method: "POST" | "PUT", body: unknown): Pr
 }
 
 export const editSource = (id: string, metadata: SourceMetadata) =>
-  jsonRequest<Source>(`${sourcePath(id)}/metadata`, "PUT", metadata);
+  jsonRequest<RegistrySource>(`${sourcePath(id)}/metadata`, "PUT", metadata);
+
+export const searchPubMed = (data: PubMedSearch) =>
+  jsonRequest<{ items: PubMedHit[] }>("/pubmed/search", "POST", data);
+
+export const savePubMed = (pmid: string) =>
+  jsonRequest<CitationSource>("/pubmed/save", "POST", { pmid });
 
 export function setSourceStatus(source: Source, status: SourceStatus) {
   return jsonRequest<Source>(`${sourcePath(source.id)}/status`, "PUT", {

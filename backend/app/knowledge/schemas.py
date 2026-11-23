@@ -66,6 +66,44 @@ class SourceMetadata(KnowledgeInput):
 
 class SourceUpload(SourceMetadata):
     version: str = Field(min_length=1, max_length=100)
+    rights_confirmed: bool = Field(default=False, strict=True)
+
+
+class PubMedSearch(KnowledgeInput):
+    query: str = Field(min_length=1, max_length=500)
+    limit: int = Field(default=10, ge=1, le=25)
+    date_from: date | None = None
+    date_to: date | None = None
+
+    @model_validator(mode="after")
+    def validate_period(self) -> "PubMedSearch":
+        if self.date_from and self.date_to and self.date_from > self.date_to:
+            raise ValueError("Start date follows end date")
+        return self
+
+
+class PubMedSelection(KnowledgeInput):
+    pmid: str = Field(pattern=r"^[1-9][0-9]{0,19}$")
+
+
+class PubMedCitation(BaseModel):
+    title: str
+    authors: list[str]
+    journal: str | None
+    year: int | None
+    publication_date: date | None
+    pmid: str
+    doi: str | None
+    pmcid: str | None
+    language: str | None
+    url: str
+
+
+class PubMedHit(PubMedCitation):
+    abstract: str | None
+    full_text_url: str | None
+    publisher_url: str | None
+    access: Literal["free_link_reported", "link_reported", "unknown"] = "unknown"
 
 
 class StatusChange(KnowledgeInput):
