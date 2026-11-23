@@ -9,6 +9,7 @@ from uuid import UUID, uuid4, uuid5
 import httpx
 import pytest
 from alembic.config import Config
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import create_engine
@@ -23,6 +24,7 @@ from app.db import database_url, get_db, get_settings
 from app.documents.models import Document, DocumentTextVersion
 from app.knowledge import service as knowledge_service
 from app.knowledge.models import MedicalChunk, MedicalSource, MedicalVersion
+from app.knowledge.schemas import PubMedHit
 from app.knowledge.vectors import KNOWLEDGE_PIPELINE, KnowledgeVectors
 from app.llm.gateway import Gateway, GatewayError, Ollama, ToolCall
 from app.main import app
@@ -116,8 +118,10 @@ def test_persistence_crud_and_isolation(setup):
     assert client.get(f"/chat/{cid}").status_code == 404
 
 
-@pytest.mark.parametrize("large", [False, True], ids=["small", "large"])
-def test_chat_cites_only_current_published_knowledge_chunks(setup, monkeypatch, large):
+@pytest.mark.parametrize(("large", "research"), [
+    (False, False), (True, False), (True, True),
+], ids=["small", "large", "mixed-pubmed-outage"])
+def test_chat_cites_only_current_published_knowledge_chunks(setup, monkeypatch, large, research):
     client, (owner, _) = setup
     points = []
     versions = {}
@@ -159,6 +163,9 @@ def test_chat_cites_only_current_published_knowledge_chunks(setup, monkeypatch, 
                     paragraphs = [
                         f'Раздел {ordinal + 1}. HbA1c: «данные» {i}.\n' for i in range(1, 40)
                     ]
+                    paragraphs[0] = (
+                        "The test shows your average blood sugar over the past 2 to 3 months.\n"
+                    )
                     text = "".join(paragraphs)
                     for index, paragraph in enumerate(paragraphs, ordinal * len(paragraphs) + 1):
                         end = offset + len(paragraph)
@@ -187,6 +194,14 @@ def test_chat_cites_only_current_published_knowledge_chunks(setup, monkeypatch, 
     # Even if the simulated vector service returns out-of-scope matches, SQL rechecks them.
     monkeypatch.setattr(knowledge_service.OllamaEmbeddings, "embed", lambda *_: [[0.1]])
     monkeypatch.setattr(KnowledgeVectors, "query_scoped", lambda *_: points)
+
+    pubmed_calls = []
+
+    def unavailable(data, *_args, **_kwargs):
+        pubmed_calls.append(data.query)
+        raise HTTPException(503, "PubMed temporarily unavailable")
+
+    monkeypatch.setattr(agent.pubmed, "search", unavailable)
     requests = []
     excerpts = []
     query = "HbA1c" if large else "гемоглобин"
@@ -195,13 +210,25 @@ def test_chat_cites_only_current_published_knowledge_chunks(setup, monkeypatch, 
         payload = json.loads(request.content)
         requests.append(payload)
         if len(requests) == 1:
+            names = {tool["function"]["name"] for tool in payload["tools"]}
+            assert ("search_pubmed" in names) == research
+            context = json.loads(payload["messages"][-1]["content"])
+            assert ("pubmed_topics" in context) == research
             message = {"tool_calls": [{"function": {
                 "name": "search_medical_knowledge", "arguments": {"query": query},
             }}]}
+            if large:
+                message["tool_calls"].append({"function": {
+                    "name": "search_pubmed", "arguments": {"query": "hba1c"},
+                }})
         elif len(requests) == 2:
-            assert json.loads(payload["messages"][-1]["content"]) == {
+            messages = payload["messages"]
+            assert json.loads(messages[-2 if large else -1]["content"]) == {
                 "status": "ok", "matches": 3 if large else 1,
             }
+            if large:
+                expected = "pubmed_unavailable" if research else "pubmed_not_requested"
+                assert json.loads(messages[-1]["content"])["error"] == expected
             message = {"content": "Справочный ответ"}
         else:
             assert "tools" not in payload
@@ -217,7 +244,11 @@ def test_chat_cites_only_current_published_knowledge_chunks(setup, monkeypatch, 
                 assert "sources" not in article
             else:
                 assert article["text"] == "Synthetic fragment published"
-            message = {"content": "Справочная информация [S1]. Лишняя ссылка [S99]."}
+            message = {"content": (
+                "HbA1c отражает средний уровень глюкозы за последние 2–3 месяца [S1]. "
+                "Лишняя ссылка [S99]."
+                if large else "Справочная информация [S1]. Лишняя ссылка [S99]."
+            )}
         return httpx.Response(200, text=json.dumps({"message": message, "done": True}) + "\n")
 
     monkeypatch.setattr(routes, "agent_gateway", lambda config: Gateway(Ollama(
@@ -225,11 +256,19 @@ def test_chat_cites_only_current_published_knowledge_chunks(setup, monkeypatch, 
     )))
     cid = client.post("/chat").json()["id"]
     question = (
-        "Что показывает гликированный гемоглобин HbA1c?" if large else "Что означает гемоглобин?"
+        "За какой период HbA1c отражает средний уровень глюкозы?"
+        if large else "Что означает гемоглобин?"
     )
+    if research:
+        question += " И найди последние исследования об HbA1c."
     events = send_events(client, cid, question)
     assert events[-1]["type"] == "done" and "[S1]" in events[1]["text"]
     assert "[S99]" not in events[1]["text"] and "Не хватило места" not in events[1]["text"]
+    assert ("PubMed временно недоступен." in events[1]["text"]) == research
+    assert pubmed_calls == (["hba1c"] if research else [])
+    if large:
+        assert "за последние 2–3 месяца [S1]" in events[1]["text"]
+        assert "не подтверждается доступными фрагментами" not in events[1]["text"]
     citations = events[-1]["sources"]
     citation = citations[0]
     assert citation["kind"] == "medical_knowledge" and "document_id" not in citation
@@ -272,6 +311,83 @@ def test_chat_history_displays_legacy_pubmed_links_as_plain_urls(setup):
     reply, = client.get(f"/chat/{cid}").json()["messages"]
     assert reply["content"] == f"Источник [S1]: {url}."
     assert reply["sources"] == [citation]
+
+
+@pytest.mark.parametrize(("provider", "abstract"), [
+    ("ollama", None), ("gigachat", "Synthetic abstract describing a survey."),
+])
+def test_chat_pubmed_displays_only_retrieved_publication_fields(
+    setup, monkeypatch, provider, abstract,
+):
+    client, _ = setup
+    settings = get_settings().model_copy(update={"gigachat_credentials": SecretStr("synthetic")})
+    monkeypatch.setattr(routes, "get_settings", lambda: settings)
+    pmid = "19671910"
+    url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+    article = PubMedHit(
+        title="Unfinished business in tobacco control", authors=["Synthetic author"],
+        journal="Synthetic journal", year=2009, publication_date=None,
+        pmid=pmid, doi="10.1001/jama.2009.1155", pmcid=None, language="eng", url=url,
+        abstract=abstract, full_text_url=None, publisher_url=None,
+    )
+    monkeypatch.setattr(agent.pubmed, "search", lambda *_args, **_kwargs: [article])
+
+    class Provider:
+        async def tool_stream(self, messages, tools):
+            assert any(tool["function"]["name"] == "search_pubmed" for tool in tools)
+            if messages[-1]["role"] != "tool":
+                yield ToolCall("search_pubmed", {"query": pmid})
+            else:
+                yield "План ответа."
+
+        async def stream(self, _messages):
+            yield "Статья показала эффективность 99% [S1]. Она доступна в PMC123 [S99]."
+
+    def gateway(config, *, external_consent=False):
+        assert config.llm_provider == provider
+        assert external_consent == (provider == "gigachat")
+        return Provider()
+
+    monkeypatch.setattr(routes, "agent_gateway", gateway)
+    cid = client.post("/chat").json()["id"]
+    body = {"content": f"Что известно о PMID {pmid}?", "llm_provider": provider}
+    if provider == "gigachat":
+        body["external_consent"] = "gigachat"
+    streamed = client.post(f"/chat/{cid}/messages", json=body)
+    events = [json.loads(line) for line in streamed.text.splitlines()]
+    assert events[-1]["type"] == "done"
+    answer = "".join(event["text"] for event in events if event["type"] == "delta")
+    assert all(part in answer for part in (article.title, url, "[S1]", article.doi))
+    assert all(unverified not in answer for unverified in ("99%", "PMC123", "S99"))
+    assert "Полный текст статьи не проверялся." in answer
+    assert (abstract or "Аннотация отсутствует в записи PubMed.") in answer
+    citation, = events[-1]["sources"]
+    assert citation["abstract_available"] == bool(abstract)
+    assert client.get(f"/chat/{cid}").json()["messages"][-1]["content"] == answer
+
+
+def test_chat_history_rejects_foreign_url_on_owned_document_citation(setup):
+    client, (owner, other) = setup
+    _, owned = publish_synthetic_report(owner.id, "Synthetic owned text.", "owned.pdf")
+    _, foreign = publish_synthetic_report(other.id, "Synthetic private text.", "foreign.pdf")
+    cid = client.post("/chat").json()["id"]
+    url = f"/documents/{foreign['payload']['document_id']}#source-page-1"
+    citation = {
+        "document_id": owned["payload"]["document_id"],
+        "text_version_id": owned["payload"]["text_version_id"],
+        "source_url": url, "source_id": "S1", "filename": "synthetic.pdf",
+        "extraction_only": True, "sources": [],
+    }
+    with Session(routes.get_engine()) as db:
+        db.add(Message(
+            conversation_id=UUID(cid), role="assistant", sources=[citation],
+            content=f"См. документ №99 [S1]: {url}",
+        ))
+        db.commit()
+    reply, = client.get(f"/chat/{cid}").json()["messages"]
+    assert reply["sources"] == []
+    assert url not in reply["content"] and "[S1]" not in reply["content"]
+    assert "№99" not in reply["content"]
 
 
 def test_failed_generation_is_not_completed(setup, monkeypatch):
@@ -529,7 +645,8 @@ def test_chat_selects_configured_provider_and_checks_consent_per_send(setup, mon
         def __init__(self, name):
             self.name = name
 
-        async def tool_stream(self, _messages, _tools):
+        async def tool_stream(self, _messages, tools):
+            assert all(tool["function"]["name"] != "search_pubmed" for tool in tools)
             calls.append(self.name)
             if calls.count("gigachat") == 2 and self.name == "gigachat":
                 raise GatewayError("oauth_http_503")
@@ -655,7 +772,7 @@ def test_native_agent_dialogue_sources_and_fallback(setup, monkeypatch, caplog):
         assert payload["stream"] is True and "format" not in payload
         assert {tool["function"]["name"] for tool in payload["tools"]} == {
             "get_documents", "search_documents", "analyze_measurements",
-            "search_medical_knowledge", "search_pubmed",
+            "search_medical_knowledge",
         }
         payloads.append(payload)
         name, value = next(cases)

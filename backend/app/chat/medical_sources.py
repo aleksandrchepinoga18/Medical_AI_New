@@ -68,10 +68,27 @@ _QUESTION_PMID = re.compile(
     r"\b(?:pmid|pubmed)(?:\s*[:№#]\s*|\s+)([1-9][0-9]{0,9})(?![\w-]|\.[0-9])",
     re.I,
 )
+_RESEARCH_REQUEST = re.compile(
+    r"\b(?:pubmed|пабмед|pmid|doi|стат(?:ья|ью|ьи|ей|ьям|ьях)|публикаци\w*|"
+    r"(?:какие|есть(?: ли)?|найди|покажи|приведи|подбери|новые|последни\w*|свежие|"
+    r"что (?:говорят|показывают))\s+(?:есть\s+)?исследовани\w*|"
+    r"(?:научн\w*|клиническ\w*|рандомизированн\w*)\s+исследовани\w*|"
+    r"(?:научн\w*|клиническ\w*)\s+доказательств\w*|"
+    r"(?:найди|приведи|какие(?: есть)?)\s+доказательств\w*|"
+    r"(?:из|согласно|по данным)\s+исследований|"
+    r"мета[- ]?анализ\w*|систематическ\w*\s+обзор\w*|"
+    r"stud(?:y|ies)|research|papers?|publications?|articles?|scientific evidence)\b"
+    r"|^исследования\b",
+)
+_DECLINED_RESEARCH = re.compile(
+    r"\b(?:без|не\s+(?:ищи|нужны|нужна|нужно|нужен))\s+(?:поиска\s+)?"
+    r"(?:(?:новых|научн\w*|клиническ\w*)\s+)?"
+    r"(?:pubmed|пабмед|стат\w*|исследовани\w*|публикаци\w*|доказательств\w*)\b",
+)
 _URL_IN_ANSWER = re.compile(r"(?:https?://|www\.)[^\s)\]<>]+", re.I)
 _MARKDOWN_URL = re.compile(
     r"(?<!\[)\[+((?:\[S[0-9]+\]|[^\[\]\r\n])+)"
-    r"(?:\]\((?:https?://|www\.)[^\s()\[\]<>]+\))+",
+    r"(?:\]\((?:https?://|www\.|/(?:api/)?documents/)[^\s()\[\]<>]+\))+",
     re.I,
 )
 _SOURCE_ID = re.compile(r"S[0-9]+")
@@ -83,6 +100,14 @@ _ID_IN_ANSWER = re.compile(
 def public_topics(question: str) -> tuple[str, ...]:
     question = normalized(question)
     return tuple(topic for topic, pattern in _TOPICS.items() if pattern.search(question))
+
+
+def requests_pubmed(question: str) -> bool:
+    question = _DECLINED_RESEARCH.sub(" ", normalized(question)).strip()
+    return bool(
+        pubmed.PMID.fullmatch(question) or _DOI_INPUT.fullmatch(question)
+        or _RESEARCH_REQUEST.search(question)
+    )
 
 
 def pubmed_query(query: str, question: str) -> str | None:
@@ -100,6 +125,7 @@ def pubmed_query(query: str, question: str) -> str | None:
             return f"doi:{doi}"
         return None
     pmid = re.sub(r"^(?:pmid|pubmed)(?:\s*[:№#]\s*|\s+)", "", term)
+    pmid = re.sub(r"\s*\[pmid\]$", "", pmid)
     if pubmed.PMID.fullmatch(pmid):
         if pmid == question.strip() or pmid in _QUESTION_PMID.findall(question):
             return f"PMID:{pmid}"
@@ -140,6 +166,7 @@ def publication_hit(hit: PubMedHit) -> dict[str, Any]:
         "source_url": hit.url,
         "sources": [],
         "text": hit.abstract,
+        "abstract_available": bool(hit.abstract),
     }
 
 

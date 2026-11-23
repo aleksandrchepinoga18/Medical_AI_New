@@ -5,6 +5,7 @@ import {
   ChatHttpError, chatRequest, readChatStream, type ChatHistory, type ChatMessage,
   type ChatProvider, type ChatProviders, type Conversation,
 } from "../lib/chat-api";
+import { ChatAnswer, safeSourceHref } from "./chat-answer";
 
 type ActiveModel = { provider: ChatProvider; name: string };
 const providerNames = ["ollama", "gigachat"] as const;
@@ -170,10 +171,12 @@ export function PersonalChat() {
         <div aria-live="polite" className="space-y-4">
           {messages.map(m => <article className="rounded border p-4" key={m.id}>
             <strong>{m.role === "user" ? "Вы" : "Помощник"}</strong>
-            <p className="whitespace-pre-wrap">{m.content}</p>
+            {m.role === "assistant"
+              ? <ChatAnswer text={m.content} sources={m.sources} />
+              : <p className="whitespace-pre-wrap">{m.content}</p>}
             {m.status !== "complete" && <p>Попытка: {m.status}</p>}
             {m.sources.map((s, i) => <div key={i}>
-              <a className="underline" href={s.source_url}>
+              <a className="underline" href={safeSourceHref(s.source_url)}>
                 {s.source_id && `[${s.source_id}] `}
                 {s.kind === "medical_knowledge" && "Медицинская база · "}
                 {s.kind === "pubmed" && "PubMed · "}

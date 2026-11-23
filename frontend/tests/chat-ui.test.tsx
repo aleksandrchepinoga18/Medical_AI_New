@@ -4,6 +4,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { PersonalChat } from "../components/chat";
+import { ChatAnswer } from "../components/chat-answer";
 import { ChatHttpError, type ChatEvent } from "../lib/chat-api";
 
 const mocks = vi.hoisted(() => ({ request: vi.fn(), stream: vi.fn(), router: { replace: vi.fn() } }));
@@ -19,6 +20,29 @@ const availableProviders = {
   gigachat: { model: cloudModel.llm_model, status: "ready" },
 };
 afterEach(() => { cleanup(); vi.resetAllMocks(); });
+it("renders an escaped Markdown subset without HTML or unverified links", () => {
+  const url = "https://pubmed.ncbi.nlm.nih.gov/19671910/";
+  const citation = {
+    kind: "pubmed" as const, pmid: "19671910", doi: null, year: 2009, authors: [],
+    journal: null, filename: "Synthetic publication", source_url: url, sources: [],
+  };
+  const text = [
+    "\\*\\*Аннотация\\*\\*",
+    "- *Сведения* \\[S1\\]",
+    `- [Официальная запись](${url})`,
+    "- [Внешний адрес](https://example.org/fake)",
+    "<img src=x onerror=alert(1)> [Запуск](javascript:alert(1))",
+  ].join("\n");
+  render(<ChatAnswer text={text} sources={[citation]} />);
+  expect(screen.getByText("Аннотация").tagName).toBe("STRONG");
+  expect(screen.getAllByRole("listitem")).toHaveLength(3);
+  expect(screen.getByText("Сведения").tagName).toBe("EM");
+  expect(screen.getByText(/\[S1\]/)).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Официальная запись" })).toHaveAttribute("href", url);
+  expect(screen.getAllByRole("link")).toHaveLength(1);
+  expect(document.querySelector("img")).toBeNull();
+});
+
 it("opens saved history and keeps a failed message for retry", async () => {
   mocks.request.mockImplementation(async (path: string, method = "GET") => {
     if (method === "POST") throw new ChatHttpError(503);

@@ -1,3 +1,4 @@
+import logging
 import re
 from calendar import month_abbr
 from datetime import date
@@ -13,6 +14,7 @@ from fastapi import HTTPException
 from app.knowledge.schemas import PubMedHit, PubMedSearch
 
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+logger = logging.getLogger(__name__)
 PMID = re.compile(r"[1-9][0-9]{0,19}")
 DOI = re.compile(r'10\.\d{4,9}/[^\s"]+', re.ASCII | re.IGNORECASE)
 PMCID = re.compile(r"PMC[1-9][0-9]*", re.IGNORECASE)
@@ -26,18 +28,23 @@ ACCESS_FILTERS: tuple[tuple[str, Literal["link_reported", "free_link_reported"]]
 
 _rate_lock = Lock()
 _next_request = 0.0
+SearchMode = Literal["pmid", "doi", "topic", "access"]
+
+
+def exact_pmid(query: str) -> str | None:
+    pmid = PMID_PREFIX.sub("", query)
+    return pmid if PMID.fullmatch(pmid) else None
 
 
 def search_term(query: str) -> tuple[str, str | None]:
-    pmid = PMID_PREFIX.sub("", query)
-    if PMID.fullmatch(pmid):
+    if pmid := exact_pmid(query):
         return f"{pmid}[pmid]", None
     doi = DOI_PREFIX.sub("", query)
     if query.lower().startswith(("http://", "https://")):
         doi = unquote(doi)
     if DOI.fullmatch(doi):
         return f'"{doi}"[aid]', doi.lower()
-    if pmid != query or DOI_PREFIX.match(query):
+    if PMID_PREFIX.match(query) or DOI_PREFIX.match(query):
         raise HTTPException(422, "Invalid PubMed identifier")
     return query, None
 
@@ -130,38 +137,58 @@ def parse_record(record: ET.Element) -> PubMedHit | None:
     )
 
 
+def upstream_error(
+    stage: str, mode: SearchMode, category: str, status: int | None,
+) -> HTTPException:
+    logger.warning(
+        "pubmed_request_failed stage=%s mode=%s category=%s http_status=%s",
+        stage, mode, category, status if status is not None else "-",
+    )
+    return HTTPException(503, "PubMed temporarily unavailable")
+
+
 def request_xml(
-    client: httpx.Client, utility: str, params: dict[str, str], root_tag: str,
+    client: httpx.Client, utility: str, params: dict[str, str], root_tag: str, mode: SearchMode,
 ) -> ET.Element:
     global _next_request
     with _rate_lock:
         sleep(max(0, _next_request - monotonic()))
         _next_request = monotonic() + 0.35
+    status = None
     try:
         with client.stream("POST", utility, data={
             "db": "pubmed", "retmode": "xml", "tool": "medical_ai_new", **params,
         }) as response:
+            status = response.status_code
             response.raise_for_status()
             data = bytearray()
             for chunk in response.iter_bytes(chunk_size=65536):
                 data.extend(chunk)
                 if len(data) > MAX_XML_BYTES:
-                    raise ValueError("PubMed response exceeds size limit")
+                    raise upstream_error(utility, mode, "response_too_large", status)
         root = ET.fromstring(data)
-        if root.tag != root_tag or root.find("ERROR") is not None:
-            raise ValueError("Unexpected PubMed response")
+        if root.tag == "ERROR" or root.find("ERROR") is not None:
+            raise upstream_error(utility, mode, "upstream_xml_error", status)
+        if root.tag != root_tag:
+            raise upstream_error(utility, mode, "unexpected_xml", status)
         return root
-    except (httpx.HTTPError, ET.ParseError, ValueError):
-        raise HTTPException(503, "PubMed temporarily unavailable") from None
+    except httpx.HTTPStatusError:
+        raise upstream_error(utility, mode, "http_status", status) from None
+    except httpx.TimeoutException:
+        raise upstream_error(utility, mode, "timeout", status) from None
+    except httpx.HTTPError:
+        raise upstream_error(utility, mode, "transport", status) from None
+    except (ET.ParseError, ValueError):
+        raise upstream_error(utility, mode, "invalid_xml", status) from None
 
 
-def search_ids(client: httpx.Client, params: dict[str, str]) -> list[str]:
-    root = request_xml(client, "esearch.fcgi", params, "eSearchResult")
+def search_ids(client: httpx.Client, params: dict[str, str], mode: SearchMode) -> list[str]:
+    root = request_xml(client, "esearch.fcgi", params, "eSearchResult", mode)
     return [pmid for node in root.findall("IdList/Id") if PMID.fullmatch(pmid := node_text(node))]
 
 
-def fetch_records(client: httpx.Client, pmids: list[str]) -> list[PubMedHit]:
-    root = request_xml(client, "efetch.fcgi", {"id": ",".join(pmids)}, "PubmedArticleSet")
+def fetch_records(client: httpx.Client, pmids: list[str], mode: SearchMode) -> list[PubMedHit]:
+    root = request_xml(client, "efetch.fcgi", {"id": ",".join(pmids)}, "PubmedArticleSet", mode)
     by_id = {}
     for record in root:
         if record.tag in {"PubmedArticle", "PubmedBookArticle"} and (entry := parse_record(record)):
@@ -176,7 +203,9 @@ def annotate_access(client: httpx.Client, entries: list[PubMedHit]) -> None:
     params = {"retmax": str(len(entries))}
     for filter_name, access in ACCESS_FILTERS:
         try:
-            matched = set(search_ids(client, {**params, "term": f"({term}) AND {filter_name}[sb]"}))
+            matched = set(search_ids(
+                client, {**params, "term": f"({term}) AND {filter_name}[sb]"}, "access",
+            ))
         except HTTPException:
             continue
         for entry in entries:
@@ -189,6 +218,8 @@ def search(
     data: PubMedSearch, contact_email: str = "", *, include_access: bool = True,
 ) -> list[PubMedHit]:
     term, doi = search_term(data.query)
+    pmid = exact_pmid(data.query)
+    mode: SearchMode = "pmid" if pmid else "doi" if doi else "topic"
     params = {"term": term, "retmax": str(data.limit), "sort": "relevance"}
     if data.date_from or data.date_to:
         params.update(
@@ -197,8 +228,11 @@ def search(
             maxdate=(data.date_to or date.max).isoformat().replace("-", "/"),
         )
     with ncbi_client(contact_email) as client:
-        ids = search_ids(client, params)[:data.limit]
-        entries = fetch_records(client, ids) if ids else []
+        ids = (
+            [pmid] if pmid and not (data.date_from or data.date_to)
+            else search_ids(client, params, mode)[:data.limit]
+        )
+        entries = fetch_records(client, ids, mode) if ids else []
         if doi is not None:
             entries = [entry for entry in entries if entry.doi == doi]
         if include_access:
@@ -214,7 +248,7 @@ def ncbi_client(contact_email: str) -> httpx.Client:
 
 def lookup(pmid: str, contact_email: str = "") -> PubMedHit:
     with ncbi_client(contact_email) as client:
-        entries = fetch_records(client, [pmid])
+        entries = fetch_records(client, [pmid], "pmid")
     if not entries:
         raise HTTPException(404, "PubMed publication not found")
     return entries[0]

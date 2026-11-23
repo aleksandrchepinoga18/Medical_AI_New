@@ -28,6 +28,7 @@ from app.chat.medical_sources import (
     public_citation_key,
     publication_hit,
     pubmed_query,
+    requests_pubmed,
 )
 from app.chat.structured_context import structured_context
 from app.core.config import Settings
@@ -129,9 +130,11 @@ PUBLIC_NOTICES = {
 }
 
 
-def tool_definitions() -> list[dict[str, Any]]:
+def tool_definitions(*, include_pubmed: bool = True) -> list[dict[str, Any]]:
     tools = []
     for name, (model, description) in TOOLS.items():
+        if name == "search_pubmed" and not include_pubmed:
+            continue
         schema = model.model_json_schema()
         # Function and property names already identify these schema nodes.
         schema.pop("title", None)
@@ -270,6 +273,8 @@ def execute_tool(
         return ToolResult({}, status="ok" if hits else "empty",
                           public_hits=[knowledge_hit(hit) for hit in hits])
     if isinstance(args, SearchPubMed):
+        if not requests_pubmed(question):
+            return ToolResult({"error": "pubmed_not_requested"})
         query = pubmed_query(args.query, question)
         if query is None:
             return ToolResult({"error": "pubmed_query_blocked"})
@@ -278,7 +283,9 @@ def execute_tool(
                 PubMedSearch(query=query, limit=3), settings.pubmed_contact_email,
                 include_access=False,
             )
-        except HTTPException:
+        except HTTPException as exc:
+            if exc.status_code == 422:
+                return ToolResult({"error": "invalid_arguments"})
             return ToolResult({"error": "pubmed_unavailable"})
         return ToolResult({}, status="ok" if entries else "empty",
                           public_hits=[publication_hit(entry) for entry in entries])
@@ -361,12 +368,17 @@ class AgentEvidence:
     calculation: tuple[str, list[EvidenceHit]] | None = None
     used_tools: bool = False
     public_attempted: bool = False
+    pubmed_attempted: bool = False
     public_hits: dict[str, dict[str, Any]] = field(default_factory=dict)
     public_citations: list[dict[str, Any]] = field(default_factory=list)
+    public_excerpts: dict[str, str] = field(default_factory=dict)
     notices: dict[str, str] = field(default_factory=dict)
 
-    def render_public(self, name: str, result: ToolResult) -> str:
+    def render_public(self, name: str, result: ToolResult, *, pubmed_requested: bool = True) -> str:
+        if name == "search_pubmed" and not pubmed_requested:
+            return encode({"error": "pubmed_not_requested"})
         self.public_attempted = True
+        self.pubmed_attempted |= name == "search_pubmed"
         if result.public_hits:
             self.notices.pop(name, None)
             for hit in result.public_hits:
@@ -410,6 +422,8 @@ class AgentEvidence:
                 ]
             fragments.append(fragment)
             self.public_citations.append(citation)
+            if fragment["text"]:
+                self.public_excerpts[label] = fragment["text"]
             budget -= len(encode(fragment).encode()) + 1
         return fragments
 
@@ -490,7 +504,8 @@ async def run_agent(
     engine: Engine, user_id: UUID, evidence: AgentEvidence, room: int,
     *, requested: tuple[int, ...], generation: UUID, question: str = "",
 ) -> list[str]:
-    tools = tool_definitions()
+    pubmed_requested = requests_pubmed(question)
+    tools = tool_definitions(include_pubmed=pubmed_requested)
     answer_room = room
     definitions = len(encode(tools).encode())
     # Like the text chat, use a conservative byte estimate. Tool definitions mostly
@@ -631,7 +646,8 @@ async def run_agent(
                 if repeated else await to_thread.run_sync(execute, abandon_on_cancel=True)
             )
             content = (
-                evidence.render_public(call.name, result) if call.name in PUBLIC_TOOLS
+                evidence.render_public(call.name, result, pubmed_requested=pubmed_requested)
+                if call.name in PUBLIC_TOOLS
                 else evidence.render(result, budget)
             )
             error = json.loads(content).get("error")

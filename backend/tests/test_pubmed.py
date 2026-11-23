@@ -1,13 +1,19 @@
 from datetime import date
 from urllib.parse import parse_qs
+from uuid import uuid4
 
 import httpx
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Response
 from pydantic import ValidationError
+from sqlalchemy.orm import Session
 
+from app.chat.agent import execute_tool
+from app.core.config import Settings
 from app.knowledge import pubmed
+from app.knowledge.routes import search_pubmed
 from app.knowledge.schemas import PubMedSearch
+from app.llm.gateway import ToolCall
 
 ARTICLE_XML = """<PubmedArticle>
 <MedlineCitation><PMID>12345678</PMID><Article>
@@ -88,6 +94,81 @@ def test_search_fetches_only_citations_and_reports_availability(monkeypatch):
     assert item.pmcid == "PMC12345678"
     assert item.full_text_url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC12345678/"
     assert item.access == "free_link_reported"
+
+
+def test_exact_pmid_returns_same_bibliography_in_admin_and_agent(monkeypatch):
+    pmid = "19671910"
+    article = ARTICLE_XML.replace("12345678", pmid)
+    fetches = []
+
+    def respond(request):
+        params = parse_qs(request.content.decode())
+        if request.url.path.endswith("/efetch.fcgi"):
+            assert params["id"] == [pmid]
+            fetches.append(params)
+            return httpx.Response(200, text=f"<PubmedArticleSet>{article}</PubmedArticleSet>")
+        assert params["term"][0].endswith("full text[sb]")
+        return httpx.Response(200, text="<eSearchResult><IdList/></eSearchResult>")
+
+    monkeypatch.setattr(pubmed, "ncbi_client", lambda _: httpx.Client(
+        base_url=pubmed.EUTILS, transport=httpx.MockTransport(respond),
+    ))
+    monkeypatch.setattr(pubmed, "sleep", lambda _: None)
+    settings = Settings(redis_password="synthetic")
+    with Session() as db:
+        admin, = search_pubmed(
+            PubMedSearch(query=pmid, limit=10), Response(), db, settings,
+        )["items"]
+        tool = execute_tool(
+            db, uuid4(), settings, ToolCall("search_pubmed", {"query": f"{pmid}[PMID]"}),
+            2000, (), f"Найди публикацию PubMed по PMID {pmid}",
+        )
+    hit, = tool.public_hits
+    assert hit["filename"] == admin.title
+    assert hit["source_url"] == admin.url and hit["text"] == admin.abstract
+    for field in ("pmid", "doi", "year", "journal", "authors"):
+        assert hit[field] == getattr(admin, field)
+    assert len(fetches) == 2 and fetches[0] == fetches[1]
+
+
+def test_pmid_search_preserves_date_filter(monkeypatch):
+    def respond(request):
+        assert request.url.path.endswith("/esearch.fcgi")
+        params = parse_qs(request.content.decode())
+        assert params["term"] == ["19671910[pmid]"]
+        assert params["datetype"] == ["pdat"]
+        assert params["mindate"] == ["2024/01/01"]
+        return httpx.Response(200, text="<eSearchResult><IdList/></eSearchResult>")
+
+    monkeypatch.setattr(pubmed, "ncbi_client", lambda _: httpx.Client(
+        base_url=pubmed.EUTILS, transport=httpx.MockTransport(respond),
+    ))
+    monkeypatch.setattr(pubmed, "sleep", lambda _: None)
+    assert pubmed.search(PubMedSearch(
+        query="19671910", date_from=date(2024, 1, 1),
+    ), include_access=False) == []
+
+
+@pytest.mark.parametrize(("status", "body", "category"), [
+    (429, "synthetic private upstream detail", "http_status"),
+    (200, "synthetic private upstream detail", "invalid_xml"),
+    (200, "<PubmedArticleSet><ERROR>synthetic private</ERROR></PubmedArticleSet>",
+     "upstream_xml_error"),
+])
+def test_exact_pmid_upstream_diagnostics_have_no_query_or_response_body(
+    monkeypatch, caplog, status, body, category,
+):
+    monkeypatch.setattr(pubmed, "ncbi_client", lambda _: httpx.Client(
+        base_url=pubmed.EUTILS,
+        transport=httpx.MockTransport(lambda _request: httpx.Response(status, text=body)),
+    ))
+    monkeypatch.setattr(pubmed, "sleep", lambda _: None)
+    with pytest.raises(HTTPException) as error:
+        pubmed.search(PubMedSearch(query="19671910"), "synthetic-contact@example.org")
+    assert error.value.status_code == 503
+    assert f"stage=efetch.fcgi mode=pmid category={category} http_status={status}" in caplog.text
+    assert "19671910" not in caplog.text
+    assert "synthetic private" not in caplog.text and "synthetic-contact" not in caplog.text
 
 
 @pytest.mark.parametrize(("status", "body"), [(429, "rate limit"), (200, "malformed response")])
