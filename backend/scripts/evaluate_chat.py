@@ -6,7 +6,9 @@ import hashlib
 import json
 import re
 from asyncio import run
+from os import fsync
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 import httpx
@@ -16,6 +18,7 @@ from app.chat.agent import MAX_CALLS, MAX_ROUNDS
 from app.core.config import Settings
 from app.documents.gigachat import GigaChatExtraction, gigachat_tls_context
 from app.llm.gateway import GatewayError
+from app.llm.gigachat import CONNECT_TIMEOUT_SECONDS
 from app.rag.adapters import RagError
 from evaluation.chat_metrics import compare_reports, summarize
 from evaluation.chat_runtime import SAFE_ERRORS, evaluate, isolated_settings
@@ -49,7 +52,7 @@ async def check_gigachat_oauth(settings: Settings) -> None:
     timeout = min(10, settings.generation_timeout)
     async with httpx.AsyncClient(
         verify=verify, trust_env=False, follow_redirects=False,
-        timeout=httpx.Timeout(timeout, connect=5),
+        timeout=httpx.Timeout(timeout, connect=CONNECT_TIMEOUT_SECONDS),
     ) as client:
         auth = GigaChatExtraction(
             client, settings.gigachat_credentials, settings.gigachat_model, "schema",
@@ -126,6 +129,68 @@ def print_progress(index: int, total: int, row: dict[str, Any]) -> None:
           flush=True)
 
 
+def write_checkpoint(path: Path, report: dict[str, Any]) -> None:
+    contents = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+    file = NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, delete=False,
+    )
+    temporary = Path(file.name)
+    try:
+        with file:
+            file.write(contents)
+            file.flush()
+            fsync(file.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def resume_rows(
+    path: Path, metadata: dict[str, Any], cases: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise ValueError("invalid_evaluation_checkpoint") from exc
+    if not isinstance(saved, dict):
+        raise ValueError("invalid_evaluation_checkpoint")
+    for key, value in metadata.items():
+        if key not in saved or saved[key] != value:
+            raise ValueError(f"resume_mismatch_{key}")
+    try:
+        rows = saved["cases"]
+        if not isinstance(rows, list):
+            raise ValueError
+        prefix = [case["id"] for case in cases[:len(rows)]]
+        if [row["id"] for row in rows] != prefix:
+            raise ValueError
+        if saved["complete"] is not (len(rows) == len(cases)):
+            raise ValueError
+        for case, row in zip(cases[:len(rows)], rows, strict=True):
+            if set(row["checks"]) != set(case["checks"]) or any(
+                value is not None and type(value) is not bool for value in row["checks"].values()
+            ):
+                raise ValueError
+        version = saved.get("checkpoint_version")
+        if version is None:
+            # Legacy reports treated the absence of a streamed answer as a failed check.
+            for row in rows:
+                if (
+                    row["error"] and not row["sources"]
+                    and row["checks"].get("no_abstract") is False
+                ):
+                    row["checks"]["no_abstract"] = None
+        elif type(version) is not int or version != 1:
+            raise ValueError
+        imported = saved.get("legacy_scenarios", len(rows) if version is None else 0)
+        if type(imported) is not int or not 0 <= imported <= len(rows):
+            raise ValueError
+        summarize(rows, live=metadata["mode"] == "live")
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid_evaluation_checkpoint") from exc
+    return rows, imported
+
+
 def safe_report(args: argparse.Namespace) -> dict[str, Any]:
     dataset, dataset_hash = load_dataset()
     selected = set(getattr(args, "case", []) or [])
@@ -163,36 +228,69 @@ def safe_report(args: argparse.Namespace) -> dict[str, Any]:
             "max_calls": MAX_CALLS,
         },
     }
+    resume = getattr(args, "resume", None)
+    rows, imported = resume_rows(resume, metadata, dataset["cases"]) if resume else ([], 0)
+    output = getattr(args, "output", None)
+    offset = len(rows)
+    diagnostics = (
+        {"gigachat_connect_timeout_seconds": CONNECT_TIMEOUT_SECONDS} if live_gigachat else {}
+    )
     if args.dry_run:
-        return {**metadata, "state": "configuration_checked"}
-    if live_gigachat:
+        return {
+            **metadata, **diagnostics, "state": "configuration_checked",
+            "scenarios_saved": offset, "scenarios_pending": len(dataset["cases"]) - offset,
+        }
+    if live_gigachat and (preflight_only or offset < len(dataset["cases"])):
         run(check_gigachat_oauth(settings))
         if preflight_only:
             return {**metadata, "state": "gigachat_oauth_checked"}
     previous = json.loads(args.compare.read_text(encoding="utf-8")) if args.compare else None
-    rows = evaluate(
-        dataset, args.provider, live=live, live_retrieval=live_retrieval,
-        allow_synthetic_cloud=args.allow_synthetic_cloud, on_case=print_progress,
-    )
-    summary = summarize(rows, live=live)
-    complete = len(rows) == len(dataset["cases"])
-    recommendations = []
-    if not complete:
-        recommendations.append("Check the selected provider credentials or connectivity.")
-    if summary["security"]["failed"]:
-        recommendations.append("Investigate failed critical checks before interpreting quality.")
-    if summary["security"]["unverified"]:
-        recommendations.append("Inspect the setup of unverified security probes.")
-    if summary["reliability"]["timeout_scenarios"]:
-        recommendations.append("Inspect LLM request phases and answer coverage before comparison.")
-    if summary["agent"]["context_errors"]:
-        recommendations.append("Inspect the tool result budget for the affected scenarios.")
-    if not summary["retrieval"]["scored"]:
-        recommendations.append("Check retrieval availability before interpreting ranking metrics.")
-    report = {
-        **metadata, "complete": complete, "summary": summary, "cases": rows,
-        "limitations": LIMITATIONS, "recommendations": recommendations,
-    }
+    total = len(dataset["cases"])
+
+    def snapshot() -> dict[str, Any]:
+        summary = summarize(rows, live=live)
+        recommendations = []
+        if len(rows) != total:
+            recommendations.append(
+                "Resume the remaining scenarios after resolving any run blocker.",
+            )
+        if summary["security"]["failed"]:
+            recommendations.append(
+                "Investigate failed critical checks before interpreting quality.",
+            )
+        if summary["security"]["unverified"]:
+            recommendations.append("Inspect the setup of unverified security probes.")
+        if summary["reliability"]["timeout_scenarios"]:
+            recommendations.append(
+                "Inspect LLM request phases and answer coverage before comparison.",
+            )
+        if summary["agent"]["context_errors"]:
+            recommendations.append("Inspect the tool result budget for the affected scenarios.")
+        if not summary["retrieval"]["scored"]:
+            recommendations.append(
+                "Check retrieval availability before interpreting ranking metrics.",
+            )
+        return {
+            **metadata, **diagnostics,
+            "checkpoint_version": 1, "legacy_scenarios": imported,
+            "complete": len(rows) == total, "summary": summary, "cases": rows,
+            "limitations": LIMITATIONS, "recommendations": recommendations,
+        }
+
+    def on_case(index: int, _total: int, row: dict[str, Any]) -> None:
+        rows.append(row)
+        if output:
+            write_checkpoint(output, snapshot())
+        print_progress(offset + index, total, row)
+
+    if offset < total:
+        evaluate(
+            {**dataset, "cases": dataset["cases"][offset:]},
+            args.provider, live=live, live_retrieval=live_retrieval,
+            allow_synthetic_cloud=args.allow_synthetic_cloud, on_case=on_case,
+        )
+    report = snapshot()
+    summary, complete = report["summary"], report["complete"]
     tracking: dict[str, Any] = {"status": "not_requested"}
     if args.mlflow_uri:
         public_params = {
@@ -215,6 +313,8 @@ def safe_report(args: argparse.Namespace) -> dict[str, Any]:
     report["mlflow"] = tracking
     if previous is not None:
         report["comparison"] = compare_reports(report, previous)
+    if output:
+        write_checkpoint(output, report)
     return report
 
 
@@ -256,6 +356,7 @@ def main() -> int:
     parser.add_argument("--allow-synthetic-cloud", action="store_true")
     parser.add_argument("--commit", required=True, help="Git revision supplied by the operator")
     parser.add_argument("--output", type=Path, help="Local JSON report")
+    parser.add_argument("--resume", type=Path, help="Continue from a matching JSON checkpoint")
     parser.add_argument("--csv", type=Path, help="Optional local CSV projection")
     parser.add_argument("--mlflow-uri", help="Opt in to local MLflow tracking")
     parser.add_argument("--compare", type=Path, help="Compare with an existing live JSON report")
@@ -269,13 +370,21 @@ def main() -> int:
         parser.error("live GigaChat requires --allow-synthetic-cloud")
     if not (args.dry_run or args.preflight_only) and args.output is None:
         parser.error("--output is required for an evaluation run")
+    if args.resume and args.preflight_only:
+        parser.error("--resume is incompatible with --preflight-only")
+    if (
+        args.resume and args.output and args.output.exists()
+        and args.output.resolve() != args.resume.resolve()
+    ):
+        parser.error("--output must be the resume checkpoint or a new path")
+    if args.csv and any(args.csv.resolve() == path.resolve()
+                        for path in (args.output, args.resume) if path):
+        parser.error("--csv must differ from the JSON report paths")
     try:
         report = safe_report(args)
         if args.dry_run or args.preflight_only:
             print(json.dumps(report, ensure_ascii=False))
             return 0
-        contents = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
-        args.output.write_text(contents, encoding="utf-8")
         if args.csv:
             write_csv(args.csv, report["cases"])
         print_summary(report)
@@ -289,7 +398,7 @@ def main() -> int:
             "selected_provider_unavailable", "invalid_dataset_cases", "invalid_dataset_sources",
             "invalid_dataset_relevance", "invalid_mlflow_uri", "synthetic_cloud_consent_required",
             "invalid_dataset_hidden_source", "unknown_evaluation_case",
-            "gigachat_preflight_requires_live",
+            "gigachat_preflight_requires_live", "invalid_evaluation_checkpoint",
         }
         if code in GIGACHAT_PREFLIGHT_ERRORS:
             print(f"Evaluation blocked: {code}. {GIGACHAT_PREFLIGHT_ERRORS[code]}")
@@ -298,12 +407,17 @@ def main() -> int:
                     if code in {"oauth_http_400", "oauth_http_401", "oauth_http_403"}
                     else "The OAuth endpoint returned an unsuccessful HTTP status.")
             print(f"Evaluation blocked: {code}. {hint}")
+        elif re.fullmatch(r"resume_mismatch_[a-z_]+", code):
+            print(f"Evaluation blocked: {code}")
         else:
             print(f"Evaluation blocked: {code if code in known else type(exc).__name__}")
         return 2
     return int(
         not report["complete"] or report["summary"]["security"]["failed"] > 0
         or report["summary"]["security"]["unverified"] > 0
+        or any(
+            row["answer"]["status"] in {"technical_error", "no_answer"} for row in report["cases"]
+        )
         or report["mlflow"]["status"] == "failed"
     )
 

@@ -19,10 +19,14 @@ def numeric_metrics(summary: dict[str, object], prefix: str = "") -> dict[str, i
     return metrics
 
 
-def local_tracking_url(tracking_uri: str, *, allow_docker_host: bool = False) -> httpx.URL:
+def local_tracking_url(
+    tracking_uri: str, *, allow_docker_host: bool = False, allow_tracking_service: bool = False,
+) -> httpx.URL:
     url = httpx.URL(tracking_uri)
     allowed_host = url.host in {"localhost", "127.0.0.1", "::1"} or (
         allow_docker_host and url.host == "host.docker.internal" and url.port == 5000
+    ) or (
+        allow_tracking_service and url.host == "mlflow" and url.port == 5000
     )
     if (
         url.scheme not in {"http", "https"} or not allowed_host
@@ -36,8 +40,12 @@ def register(
     tracking_uri: str, summaries: dict[str, dict[str, object]], params: dict[str, str],
     *, experiment_name: str = EXPERIMENT, run_name: str = "synthetic PDFs",
     artifact_json: bytes | None = None, allow_docker_host: bool = False,
+    allow_tracking_service: bool = False,
 ) -> str:
-    url = local_tracking_url(tracking_uri, allow_docker_host=allow_docker_host)
+    url = local_tracking_url(
+        tracking_uri, allow_docker_host=allow_docker_host,
+        allow_tracking_service=allow_tracking_service,
+    )
     with httpx.Client(
         base_url=str(url).rstrip("/") + "/api/2.0/mlflow/",
         timeout=10, trust_env=False, follow_redirects=False,

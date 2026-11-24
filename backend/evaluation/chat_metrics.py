@@ -49,6 +49,16 @@ def exact_number(answer: str, expected: str) -> bool:
     return bool(re.search(rf"(?<![\w.+-]){pattern}(?!\w|[.,]\d)", normalized_answer(answer)))
 
 
+def equivalent_number(answer: str, expected: str) -> bool:
+    """Recognize formatting variants for diagnostics of the personal fixtures."""
+    answer = normalized_answer(answer).replace("**", "")
+    answer = re.sub(r"\s*/\s*", "/", answer)
+    answer = re.sub(r"\s+%", "%", answer)
+    for localized, original in (("ммоль/л", "mmol/l"), ("г/л", "g/l"), ("мг/дл", "mg/dl")):
+        answer = answer.replace(localized, original)
+    return exact_number(answer, expected)
+
+
 def citations_valid(text: str, sources: list[dict[str, Any]]) -> bool:
     labels = {source.get("source_id") for source in sources}
     pmids = {source.get("pmid") for source in sources}
@@ -106,7 +116,7 @@ def summarize(rows: list[dict[str, Any]], *, live: bool = False) -> dict[str, An
         if row["answer"]["status"] not in {"no_answer", "technical_error"}
     ]
     quality = [row["answer"] for row in completed]
-    timeouts = {"timeout", "gigachat_timeout"}
+    timeouts = {"timeout", "gigachat_timeout", "oauth_timeout"}
     llm_errors = Counter(
         request["error"] for row in ordinary for request in row.get("llm_requests", [])
         if request["error"]

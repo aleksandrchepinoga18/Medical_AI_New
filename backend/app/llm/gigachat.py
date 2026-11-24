@@ -17,10 +17,12 @@ from app.llm.gateway import (
     ToolCall,
     _StructuredOutputLimit,
     generation_log_id,
+    http_timeout_kind,
     response_lines,
 )
 
 logger = logging.getLogger("uvicorn.error").getChild("gigachat")
+CONNECT_TIMEOUT_SECONDS = 5
 
 
 def function_parameters(schema: dict[str, Any]) -> dict[str, Any]:
@@ -192,7 +194,8 @@ class GigaChat:
             async with asyncio.timeout(timeout):
                 async with httpx.AsyncClient(
                     verify=verify, transport=self.transport, trust_env=False,
-                    follow_redirects=False, timeout=httpx.Timeout(timeout, connect=5),
+                    follow_redirects=False,
+                    timeout=httpx.Timeout(timeout, connect=CONNECT_TIMEOUT_SECONDS),
                 ) as client:
                     # Use the existing OAuth implementation without uploading a file.
                     auth = GigaChatExtraction(
@@ -230,8 +233,8 @@ class GigaChat:
                                 async for event in events:
                                     yield event
                             return
-        except (TimeoutError, httpx.TimeoutException):
-            raise GatewayError("gigachat_timeout") from None
+        except (TimeoutError, httpx.TimeoutException) as error:
+            raise GatewayError("gigachat_timeout", timeout_kind=http_timeout_kind(error)) from None
         except httpx.HTTPError:
             raise GatewayError("gigachat_transport") from None
         except (ValueError, TypeError, KeyError, AttributeError):

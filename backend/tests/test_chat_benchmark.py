@@ -120,6 +120,175 @@ def test_numerical_matching_and_citation_checks_reject_invented_details():
     assert not citations_valid("Источник [S99]", sources)
 
 
+def test_personal_diagnostics_distinguish_fixture_spelling_from_exact_scores():
+    dataset, _ = evaluate_chat.load_dataset()
+    cases = {case["id"]: case for case in dataset["cases"]}
+    potassium = cases["potassium-first"]
+    assert chat_runtime.expected_content(potassium, "Калий: **4,2** ммоль / л.") == {
+        "fact_hits": 0, "numeric_hits": 0, "format_equivalent_numeric_hits": 1,
+    }
+    assert chat_runtime.expected_content(potassium, "Калий: 14,2 ммоль/л.")[
+        "format_equivalent_numeric_hits"
+    ] == 0
+    trend = cases["trend-creatinine"]
+    assert chat_runtime.expected_content(trend, "+14,29 %")[
+        "format_equivalent_numeric_hits"
+    ] == 1
+    assert chat_runtime.expected_content(trend, "-14,29 %")[
+        "format_equivalent_numeric_hits"
+    ] == 0
+    assert chat_runtime.expected_content(cases["personal-search"], "Креатинин найден") == {
+        "fact_hits": 0, "numeric_hits": 0, "format_equivalent_numeric_hits": 0,
+        "localized_indicator_present": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("answer", "sources", "complete", "expected"),
+    [
+        ("", [], False, None),
+        ("Нет финального сообщения", [], True, None),
+        ("Выдержка из аннотации: синтетический текст", [], False, False),
+        ("Аннотация отсутствует", [{"kind": "pubmed", "abstract_available": False}], True, True),
+        ("", [{"kind": "pubmed", "abstract_available": True}], False, False),
+    ],
+)
+def test_no_abstract_distinguishes_failure_from_unverified(answer, sources, complete, expected):
+    case = {"tools": [{"name": "search_pubmed"}], "checks": ["no_abstract"]}
+    trace = chat_runtime.Trace()
+    trace.tools.append({"name": "search_pubmed", "error": None})
+    assert chat_runtime.security_checks(
+        case, set(), answer, trace, [], denied=False, history_ok=None,
+        sources=sources, answer_complete=complete,
+    ) == {"no_abstract": expected}
+
+
+def test_evaluation_checkpoints_and_resumes_legacy_rows(monkeypatch, tmp_path):
+    output = tmp_path / "checkpoint.json"
+    settings = Settings(llm_provider="gigachat", redis_password="synthetic")
+    monkeypatch.setattr(evaluate_chat, "isolated_settings", lambda *args, **kwargs: settings)
+    preflights = []
+
+    async def preflight(_settings):
+        preflights.append(True)
+
+    monkeypatch.setattr(evaluate_chat, "check_gigachat_oauth", preflight)
+    args = Namespace(
+        dry_run=False, mode="live", provider="gigachat", retrieval="qdrant",
+        commit="42375cb", mlflow_uri=None, compare=None, allow_synthetic_cloud=True,
+        case=["creatinine-first", "pubmed-pmid", "pubmed-doi"],
+        output=output, resume=None,
+    )
+    seen = []
+
+    def run_cases(dataset, _provider, *, on_case, **_kwargs):
+        for index, case in enumerate(dataset["cases"], 1):
+            identifier = case["id"]
+            seen.append(identifier)
+            if not args.resume and identifier == "pubmed-doi":
+                raise KeyboardInterrupt
+            is_timeout = identifier == "pubmed-pmid"
+            error = "gigachat_unavailable" if is_timeout else None
+            row = {
+                "id": identifier, "llm_backend": "live", "llm_calls": 1,
+                "llm_ms": 5, "wall_ms": 6,
+                "checks": dict.fromkeys(case["checks"], not is_timeout),
+                "tools": [], "routing_ok": True, "mixed": False, "extra_pubmed": False,
+                "context_error": False, "fallback": None, "sources": [], "error": error,
+                "answer": score_answer(case, "0.91 mg/dL" if not error else "", [], set(), error),
+                "llm_requests": [{"error": "gigachat_timeout" if is_timeout else None}],
+            }
+            on_case(index, len(dataset["cases"]), row)
+            saved = json.loads(output.read_text(encoding="utf-8"))
+            assert saved["cases"][-1]["id"] == identifier
+
+    monkeypatch.setattr(evaluate_chat, "evaluate", run_cases)
+    with pytest.raises(KeyboardInterrupt):
+        evaluate_chat.safe_report(args)
+    saved = json.loads(output.read_text(encoding="utf-8"))
+    assert not saved["complete"] and saved["cases"][1]["answer"]["status"] == "technical_error"
+    for key in ("checkpoint_version", "legacy_scenarios"):
+        saved.pop(key)
+    output.write_text(json.dumps(saved), encoding="utf-8")
+    args.resume = output
+    args.commit = "7654321"
+    with pytest.raises(ValueError, match="^resume_mismatch_commit$"):
+        evaluate_chat.safe_report(args)
+    assert len(preflights) == 1
+
+    args.commit = "42375cb"
+    args.dry_run = True
+    configuration = evaluate_chat.safe_report(args)
+    assert configuration["scenarios_saved"] == 2 and configuration["scenarios_pending"] == 1
+    assert len(preflights) == 1
+    seen.clear()
+    args.dry_run = False
+    result = evaluate_chat.safe_report(args)
+    assert seen == ["pubmed-doi"]
+    assert result["complete"] and result["legacy_scenarios"] == 2
+    assert result["cases"][1]["checks"] == {"no_abstract": None}
+    assert result["summary"]["security"]["unverified"] == 1
+    assert result["summary"]["reliability"]["outcomes"]["technical_error"] == 1
+
+
+def test_live_evaluation_continues_after_timeout_and_stops_on_rate_limit(monkeypatch):
+    config = SimpleNamespace()
+    monkeypatch.setattr(chat_runtime, "isolated_settings", lambda *args, **kwargs: config)
+    for name in ("TestClient", "Session"):
+        monkeypatch.setattr(
+            chat_runtime, name, lambda *_args, **_kwargs:
+            nullcontext(SimpleNamespace(commit=lambda: None)),
+        )
+    monkeypatch.setattr(chat_runtime, "get_engine", lambda: None)
+    monkeypatch.setattr(chat_runtime, "registered", lambda _client: uuid4())
+    monkeypatch.setattr(chat_runtime, "seed_personal", lambda *_args: None)
+    monkeypatch.setattr(chat_runtime, "seed_knowledge", lambda *_args, **_kwargs: None)
+
+    def read_case(_client, _dataset, case, *_args, **_kwargs):
+        return {
+            **case, "error": "gigachat_unavailable",
+            "llm_requests": [{"error": case["request_error"]}],
+        }
+
+    monkeypatch.setattr(chat_runtime, "evaluate_case", read_case)
+    cases = [
+        {"id": "first", "request_error": "gigachat_timeout"},
+        {"id": "second", "request_error": "gigachat_http_429"},
+        {"id": "third", "request_error": None},
+    ]
+    saved = []
+    rows = evaluate(
+        {"cases": cases, "publications": []}, "gigachat", live=True, live_retrieval=False,
+        allow_synthetic_cloud=True, on_case=lambda _index, _total, row: saved.append(row["id"]),
+    )
+    assert saved == [row["id"] for row in rows] == ["first", "second"]
+
+
+@pytest.mark.integration
+def test_offline_personal_tools_expose_expected_fixture_content():
+    if environ.get("RUN_RAG_INTEGRATION") != "1":
+        pytest.skip("Use the isolated RAG test stack with PostgreSQL")
+    cases = {
+        "potassium-first", "hemoglobin-first", "glucose-second", "personal-search",
+        "compare-creatinine", "trend-creatinine",
+    }
+    dataset, _ = evaluate_chat.load_dataset()
+    dataset["cases"] = [case for case in dataset["cases"] if case["id"] in cases]
+    rows = evaluate(dataset, "ollama", live=False, live_retrieval=False)
+    assert {row["id"] for row in rows} == cases
+    for row in rows:
+        first_tool = row["tools"][0]
+        assert first_tool["error"] is None
+        assert first_tool["expected_content"]["fact_hits"] == 1, row["id"]
+        assert first_tool["expected_content"]["numeric_hits"] == (
+            0 if row["id"] == "personal-search" else 1
+        ), row["id"]
+        assert any(
+            request.get("input_expected_content", {}).get("fact_hits") == 1
+            for request in row["llm_requests"]
+        ), row["id"]
+
+
 def test_dry_run_does_not_invoke_evaluation_or_mlflow(monkeypatch):
     settings = SimpleNamespace(
         generation_model="qwen2.5:7b-instruct", generation_context=4096,
@@ -212,7 +381,7 @@ def test_gigachat_preflight_requires_local_ca(monkeypatch, tmp_path):
 def test_evaluation_reports_llm_phase_and_safe_errors(capsys):
     async def failing_final(_messages):
         yield "SYNTHETIC-PRIVATE"
-        raise GatewayError("timeout")
+        raise GatewayError("gigachat_timeout", timeout_kind="connect")
 
     async def scenario():
         trace = chat_runtime.Trace()
@@ -226,8 +395,8 @@ def test_evaluation_reports_llm_phase_and_safe_errors(capsys):
 
     request = run(scenario())
     assert request["phase"] == "grounded_answer" and request["round"] == 2
-    assert request["error"] == "timeout" and request["received_text"]
-    assert request["timeout_origin"] == "provider_request"
+    assert request["error"] == "gigachat_timeout" and request["received_text"]
+    assert request["timeout_origin"] == "provider_request" and request["timeout_kind"] == "connect"
     assert request["context_bytes"] > 0 and request["ms"] >= request["first_event_ms"]
     assert "PRIVATE" not in repr(request)
     issues = chat_runtime.argument_issues(ToolCall("get_documents", {

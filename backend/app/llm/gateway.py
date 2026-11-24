@@ -41,6 +41,19 @@ async def response_lines(response: httpx.Response) -> AsyncIterator[bytes]:
 class GatewayError(Exception):
     """Safe machine-readable error; no upstream payload."""
 
+    def __init__(self, code: str, *, timeout_kind: str | None = None) -> None:
+        super().__init__(code)
+        self.timeout_kind = timeout_kind
+
+
+def http_timeout_kind(error: TimeoutError | httpx.TimeoutException) -> str:
+    if isinstance(error, httpx.TimeoutException):
+        return {
+            httpx.ConnectTimeout: "connect", httpx.ReadTimeout: "read",
+            httpx.WriteTimeout: "write", httpx.PoolTimeout: "pool",
+        }.get(type(error), "http")
+    return "deadline"
+
 
 class _StructuredOutputLimit(Exception):
     """The provider reached num_predict after yielding its last structured chunk."""

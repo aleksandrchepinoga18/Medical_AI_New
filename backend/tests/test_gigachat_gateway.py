@@ -9,7 +9,7 @@ from app.chat.agent import tool_definitions
 from app.chat.routes import AGENT_SYSTEM
 from app.core.config import Settings
 from app.llm.gateway import Gateway, GatewayError, ToolCall, gateway
-from app.llm.gigachat import GigaChat
+from app.llm.gigachat import CONNECT_TIMEOUT_SECONDS, GigaChat
 
 TOOLS = [{"type": "function", "function": {
     "name": "get_test_code",
@@ -53,6 +53,32 @@ def test_cloud_factory_requires_config_and_explicit_opt_in():
     assert isinstance(
         gateway(local_default, provider="gigachat", external_consent=True).provider, GigaChat,
     )
+
+
+@pytest.mark.parametrize(
+    ("phase", "error", "code", "kind"),
+    [
+        ("chat", httpx.ConnectTimeout, "gigachat_timeout", "connect"),
+        ("chat", httpx.ReadTimeout, "gigachat_timeout", "read"),
+        ("oauth", httpx.ConnectTimeout, "oauth_timeout", "connect"),
+    ],
+)
+def test_timeout_kind_preserves_existing_request_limits(phase, error, code, kind):
+    config = settings()
+
+    def respond(request):
+        assert request.extensions["timeout"] == {
+            "connect": CONNECT_TIMEOUT_SECONDS, "read": config.generation_timeout,
+            "write": config.generation_timeout, "pool": config.generation_timeout,
+        }
+        if request.url.path.endswith("/oauth") and phase != "oauth":
+            return token()
+        raise error("upstream secret", request=request)
+
+    model = Gateway(GigaChat(config, transport=httpx.MockTransport(respond)))
+    with pytest.raises(GatewayError, match=f"^{code}$") as raised:
+        asyncio.run(model.generate([{"role": "user", "content": "synthetic"}]))
+    assert raised.value.timeout_kind == kind
 
 
 def test_function_calls_sse_round_trip_and_oauth_reuse():

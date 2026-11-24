@@ -149,6 +149,14 @@ CLI печатает статус и длительность после каж�
 показывает способ завершения потока. `missing_tools` на уровне сценария
 перечисляет ожидавшиеся инструменты, которые Agent Loop не выполнил.
 Диагностика исключает содержимое сообщений и значения параметров.
+Для персональных сценариев отчёт сравнивает эталон с результатом инструмента
+(`tools[].expected_content`), контекстом инструмента, переданным модели
+(`llm_requests[].input_expected_content`), текстом модели до проверки
+(`llm_requests[].expected_content`) и опубликованным ответом
+(`published_expected_content`). `format_equivalent_numeric_hits` отдельно
+учитывает некоторые варианты записи тех же чисел и единиц.
+В `personal-search` также отмечается наличие русского названия показателя.
+Эти поля не влияют на исходные оценки и сохраняют только счётчики и флаги.
 Укажите `--retrieval fixed` в обоих прогонах, если задача только сравнить
 генерацию на тех же фиксированных источниках.
 
@@ -188,6 +196,94 @@ CLI возвращает код ошибки до выполнения сцен�
 запустите `rt_gigachat --preflight-only`. Ожидается
 `"state": "gigachat_oauth_checked"`. `--dry-run` проверяет локальные настройки
 и не обращается в сеть.
+
+### Продолжение GigaChat на базе `42375cb`
+
+JSON обновляется атомарно после каждого сценария. `--resume` сверяет SHA‑256
+и версию датасета, выбранные сценарии, режим, провайдер, модель, настройки
+retrieval, лимиты модели и переданную оператором ревизию. Для отчёта от
+`42375cb` запускайте из рабочего дерева на этом же HEAD с правками этапа 6.6.
+Поле `legacy_scenarios` отмечает число строк из отчёта без checkpoint-метаданных.
+
+`complete=true` означает, что записаны результаты всех сценариев. Код
+возврата остаётся ненулевым при технической ошибке, отсутствующем ответе
+или проваленной либо непроверенной критической проверке. Одиночный тайм-аут
+не останавливает цикл. Если к дедлайну синхронный инструмент ещё работал,
+прогон останавливается после записи ошибки. Live GigaChat также
+останавливается при проблемах конфигурации, авторизации, TLS OAuth или
+ограничении частоты. Для повторной попытки отдельного сценария используйте
+`--case` с отдельным отчётом.
+
+```bash
+revision=42375cb
+checkpoint=/reports/gigachat-live.json
+resumed=/reports/gigachat-live-resumed.json
+if [[ -f evaluation-reports/gigachat-live-resumed.json ]]; then
+  checkpoint="$resumed"
+fi
+rt_gigachat --dry-run --resume "$checkpoint" &&
+  rt_gigachat --resume "$checkpoint" --output "$resumed" \
+  --csv /reports/gigachat-live-resumed.csv
+```
+
+При первом продолжении dry run показывает 17 сохранённых и 13 оставшихся
+сценариев. Первый вызов модели соответствует сценарию №18 `pubmed-doi`.
+Попытка №17 `pubmed-pmid` сохраняет техническую ошибку, а `no_abstract`
+получает значение `null` (`unverified`). Исходный JSON сохраняется отдельно.
+
+### Точечная проверка диагностики
+
+```bash
+rt_run python -m pytest -q -m 'not integration' \
+  tests/test_chat_benchmark.py tests/test_gigachat_gateway.py tests/test_gigachat_extraction.py
+rt_run python -m pytest -q \
+  tests/test_chat_benchmark.py::test_offline_personal_tools_expose_expected_fixture_content
+```
+
+Первый запуск проверяет checkpoint, продолжение, обработку ошибок и
+тайм-аутов на заглушках. Второй использует подготовленную синтетическую БД
+и проверяет, что эталон найден в выдаче инструмента и передан в модельный
+контекст во всех шести сценариях.
+
+В сохранённом прогоне `grounded_answer` имел общий дедлайн сценария
+180 секунд, тайм-аут запроса 180 секунд и отдельный тайм-аут соединения
+HTTPX 5 секунд. Ранее подтип `gigachat_timeout` отсутствовал, поэтому
+5054 мс указывают на лимит соединения только косвенно. В новых отчётах
+`timeout_kind` различает `connect`, `read`, `write`, `pool` и
+`deadline`. Ошибка получения токена указывается как `oauth_timeout`.
+Для проверки одного запроса с прежними условиями поиска и явным согласием
+используйте отдельный отчёт.
+
+```bash
+rt_gigachat --case pubmed-pmid --output /reports/gigachat-pmid-diagnostic.json
+```
+
+В шести partial есть следующие эталоны и данные синтетических документов.
+
+| Сценарий | Эталон и его источник | Что видно в старом отчёте |
+|---|---|---|
+| `potassium-first` | doc1, `4.2 mmol/L` | `get_documents` вместо `analyze_measurements` |
+| `hemoglobin-first` | doc1, `132 g/L` | `get_documents` вместо `analyze_measurements` |
+| `glucose-second` | doc2, `5.8 mmol/L` | `get_documents` вместо `analyze_measurements` |
+| `personal-search` | doc1, `Creatinine` | `get_documents` вместо `search_documents` |
+| `compare-creatinine` | doc1 → doc2, `1.04 − 0.91 = +0.13` | Вызван `analyze_measurements` |
+| `trend-creatinine` | doc1 → doc2, `0.13 / 0.91 × 100 ≈ +14.29%` | Вызван `analyze_measurements` |
+
+Во всех шести строках зафиксировано предупреждение о неподтверждённых
+утверждениях и есть нужные ссылки. Сохранённых аргументов инструментов,
+результатов инструментов и текста до фильтрации нет. Поэтому нельзя
+установить, где именно пропало совпадение в каждой исторической строке.
+У `personal-search` исходный критерий принимает только английское имя.
+Числовой критерий требует точное написание единицы и знака, если они
+заданы в эталоне. Например, `4,2 ммоль/л` даёт 0 для эталона
+`4.2 mmol/L`. Чтобы проверить эти причины на новых ответах, повторите
+только шесть сценариев в диагностический файл.
+
+```bash
+rt_gigachat --case potassium-first --case hemoglobin-first --case glucose-second \
+  --case personal-search --case compare-creatinine --case trend-creatinine \
+  --output /reports/gigachat-personal-diagnostic.json
+```
 
 ### Проверка изоляции
 
@@ -247,3 +343,47 @@ Redis и Qdrant подключены только к внутренней тес
 **Artifacts → evaluation.json**. В нём только коды сценариев, проверки,
 метрики, псевдонимы источников и безопасная конфигурация. Тексты сообщений,
 документов, запросов PubMed, ключи и токены в отчёт не записываются.
+
+### Импорт готового отчёта GigaChat
+
+Для `gigachat-live-resumed.json` запуск Evaluation не нужен. Импортёр принимает
+полный checkpoint этапа 6.6 от ревизии `42375cb` с датасетом `6.6.2` и
+конфигурацией сохранённого прогона. Он сверяет хеш датасета и состав сценариев,
+пересчитывает агрегаты из сохранённых строк и принимает только поля, коды
+и псевдонимы синтетического отчёта. Свободный текст, неизвестные поля,
+значения ключей и реальные идентификаторы в такой схеме отклоняются.
+
+Из корня проекта в Git Bash, при работающем MLflow и уже собранном локальном
+образе backend, выполните одну команду. Для нестандартного имени Compose-проекта
+укажите его в shell-переменной `COMPOSE_PROJECT_NAME`.
+
+```bash
+MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' docker run --rm --pull never --read-only \
+  --network "${COMPOSE_PROJECT_NAME:-medical-ai}_tracking" \
+  --mount "type=bind,source=$(cygpath -am "$PWD/backend/evaluation"),target=/app/evaluation,readonly" \
+  --mount "type=bind,source=$(cygpath -am "$PWD/backend/scripts"),target=/app/scripts,readonly" \
+  --mount "type=bind,source=$(cygpath -am "$PWD/evaluation-reports/gigachat-live-resumed.json"),target=/report.json,readonly" \
+  "${COMPOSE_PROJECT_NAME:-medical-ai}-backend" python -m scripts.register_chat_report \
+  --report /report.json --mlflow-uri http://mlflow:5000
+```
+
+Контейнер подключён только к внутренней сети `tracking`. Эта сеть даёт
+доступ к MLflow, а основной PostgreSQL подключён к отдельной сети
+`app-db`. Для импорта достаточно файла отчёта, датасета и кода. Запросы
+GigaChat, Agent Loop и retrieval при импорте не выполняются.
+
+После импорта CLI печатает `run_id`. В эксперименте `medical-ai-evaluation`
+ожидается запись `live gigachat (imported)` с параметрами `complete=true`,
+`technical_errors=2`, `has_technical_errors=true`, `security_unverified=3`
+и `validation_scope=synthetic_benchmark`. `Artifacts → evaluation.json`
+содержит исходный JSON побайтно. Локальный файл остаётся без записи, поэтому
+внутри артефакта сохраняется `mlflow.status=not_requested`. Повтор команды
+создаёт ещё один run. Статус `FINISHED` означает успешную запись в MLflow.
+Медицинская валидация находится вне области этого прогона.
+
+Точечная проверка использует заглушку MLflow и проверяет, что неверные метрики,
+неполный отчёт и чувствительные поля отклоняются до регистрации.
+
+```bash
+rt_run python -m pytest -q tests/test_register_chat_report.py
+```
