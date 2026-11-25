@@ -5,7 +5,7 @@ import json
 import math
 import re
 from collections.abc import Callable, Iterator
-from typing import Any
+from typing import Any, ClassVar
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
@@ -202,7 +202,7 @@ def ensure_payload_indexes(
 
 
 class QdrantVectors:
-    payload_indexes = PERSONAL_PAYLOAD_INDEXES
+    payload_indexes: ClassVar[tuple[str, ...]] = PERSONAL_PAYLOAD_INDEXES
 
     def __init__(self, settings: Settings) -> None:
         if not re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", settings.rag_collection):

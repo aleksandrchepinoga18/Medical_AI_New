@@ -292,7 +292,7 @@ def execute_tool(
                           public_hits=[publication_hit(entry) for entry in entries])
     assert isinstance(args, (ListDocuments, SearchDocuments, AnalyzeMeasurements))
     selected = list(dict.fromkeys(args.documents))
-    extractions = []
+    extractions: list[Extraction] = []
     if selected:
         extractions, notice = resolve_documents(db, user_id, tuple(selected))
         if notice:
@@ -396,7 +396,7 @@ class AgentEvidence:
         })
 
     def public_fragments(self, budget: int) -> list[dict[str, Any]]:
-        fragments = []
+        fragments: list[dict[str, str | int | bool | list[str] | None]] = []
         first: dict[str, str] = {}
         for key, hit in self.public_hits.items():
             first.setdefault(hit["kind"], key)

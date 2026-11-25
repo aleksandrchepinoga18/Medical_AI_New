@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, ClassVar
 from uuid import UUID, uuid5
 
 from app.core.config import KNOWLEDGE_COLLECTION, Settings
@@ -10,7 +10,7 @@ KNOWLEDGE_PIPELINE = "medical-ai-knowledge-v1"
 
 
 class KnowledgeVectors(QdrantHybrid):
-    payload_indexes = (
+    payload_indexes: ClassVar[tuple[str, ...]] = (
         "pipeline", "source_id", "version_id", "generation", "fingerprint", "chunk_id",
     )
 
