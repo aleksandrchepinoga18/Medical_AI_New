@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from importlib.metadata import version
 from pathlib import Path
 from time import monotonic
 from uuid import uuid4
@@ -32,7 +33,7 @@ def test_default_local_provider_preserves_text_and_anchors_rows(tmp_path: Path) 
     assert result.locators[0]["index"] == 1
     assert result.structured and result.structured.local
     local = result.structured.local
-    assert local.provider == "pymupdf_tables" and local.provider_version == "1.26.6"
+    assert local.provider == "pymupdf_tables" and local.provider_version == version("pymupdf")
     assert [(row.name, row.value) for row in local.measurements] == [
         (row.name, row.value) for row in expected
     ]

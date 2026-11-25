@@ -16,7 +16,7 @@ import httpx
 from pydantic import SecretStr, ValidationError
 
 from app.documents.extraction_data import Evidence, Measurement, Measurements
-from app.llm.gateway import GatewayError
+from app.llm.gateway import GatewayError, http_timeout_kind
 
 logger = logging.getLogger(__name__)
 
@@ -137,8 +137,8 @@ class GigaChatExtraction:
         try:
             async with asyncio.timeout(timeout):
                 response = await self.client.post(url, **kwargs)
-        except (TimeoutError, httpx.TimeoutException):
-            raise GatewayError(f"{phase}_timeout") from None
+        except (TimeoutError, httpx.TimeoutException) as error:
+            raise GatewayError(f"{phase}_timeout", timeout_kind=http_timeout_kind(error)) from None
         except httpx.HTTPError as error:
             failure = "tls" if is_tls_error(error) else "transport"
             raise GatewayError(f"{phase}_{failure}") from None

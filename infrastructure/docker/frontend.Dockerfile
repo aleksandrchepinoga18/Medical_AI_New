@@ -1,9 +1,8 @@
 FROM node:22.21.1-bookworm-slim AS dependencies
 WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
-COPY frontend/package*.json ./
-# До создания пользователем lockfile используется npm install; после — npm ci.
-RUN if [ -f package-lock.json ]; then npm ci --include=dev; else npm install --include=dev --package-lock=false; fi \
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --include=dev \
     && test -x node_modules/.bin/next
 
 FROM dependencies AS development

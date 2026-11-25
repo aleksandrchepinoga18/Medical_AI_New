@@ -1,0 +1,22 @@
+# Apply after compose.rag-test.yaml and compose.rag-test-local-model.yaml.
+services:
+  tests:
+    environment:
+      GIGACHAT_CA_BUNDLE: /run/gigachat-ca/root.crt
+    volumes:
+      - type: bind
+        source: ./certs/gigachat/russian_trusted_root_ca_pem.crt
+        target: /run/gigachat-ca/root.crt
+        read_only: true
+        bind:
+          create_host_path: false
+    networks: !override
+      default: {}
+      inference: {}
+      evaluation_egress:
+        gw_priority: 1
+
+networks:
+  evaluation_egress:
+    driver: bridge
+    internal: false

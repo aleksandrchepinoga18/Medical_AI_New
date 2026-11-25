@@ -1,141 +1,70 @@
-# Medical AI
+# Medical AI New
 
-Новый проект по [утверждённому ТЗ](docs/TZ.md). Этап 1: каркас FastAPI и Next.js,
-PostgreSQL, MinIO, Redis/Celery, Qdrant, MLflow Tracking и Model Registry.
-Бизнес-модули, обработка документов, LLM-вызовы и логирование экспериментов
-на этом этапе не реализованы.
+Medical AI New — самостоятельная веб-платформа для работы с медицинскими документами, поиска по личным данным и проверенным источникам, а также общения с LLM. Проект в активной разработке. Текущий контур предназначен для разработки и проверки на синтетических данных. Промышленная готовность, сертификация и медицинская валидация не подтверждены.
 
-MinIO Server и Client устанавливаются из официальных GitHub release assets
-с фиксированными версиями и проверкой SHA-256. `minio-init` собирается локально;
-образы `minio/mc` и `minio/minio` не требуются. Инструкция пересборки без удаления
-данных: [исправление установки MinIO Client](docs/OPERATIONS.md#исправление-установки-minio-client).
+## Возможности
 
-**Codex редактирует файлы. Все команды ниже выполняет пользователь в Git Bash
-для Windows. Codex команды исполнения не запускает.**
+- Регистрация, вход, защищённые сессии и личный кабинет.
+- Загрузка PDF/DOCX, хранение оригиналов, фоновое извлечение текста, версионирование и личный поиск.
+- Чат с историей, потоковыми ответами и проверяемыми ссылками. Локальная генерация через Ollama/Qwen. GigaChat доступен при отдельной настройке и явном согласии.
+- Отдельная медицинская база знаний с проверкой и публикацией версий. Контролируемый поиск PubMed.
+- Извлечение лабораторных показателей из PDF, отображение строк и источников, сравнение и динамика в чате с расчётами на Python.
+- Синтетические бенчмарки RAG, чата и извлечения. MLflow Tracking и Model Registry для экспериментов.
 
-На 14 ноября 2026 года пользователь подтвердил завершение этапа 1 и работающую
-инфраструктуру; исходный код зафиксирован коммитом `c22fae1`.
-План этапов 2–10 и вопросы сверки: [CODEX_TASKS.md](docs/CODEX_TASKS.md).
-Код этапа 2 подготовлен, приёмка ожидается. Авторизация, миграции и команды проверки:
-[STAGE2.md](docs/STAGE2.md). До ручной приёмки не переходить к этапу 3.
+Ограничения текущего объёма включают отсутствие локального OCR, поддержки TXT/JPG/PNG, сквозного удаления документов, ручного подтверждения показателей, отдельной аналитики с графиками и пользовательского экспорта. OpenAI, DeepSeek и YandexGPT остаются в плане. Состояние проверок, результаты Evaluation и критерии промышленного допуска приведены в [аудите проекта](docs/PROJECT_AUDIT.md).
 
-## Файлы
+## Архитектура и стек
 
-```text
-backend/                  FastAPI, настройки, Celery, unit tests
-frontend/                 Next.js App Router, TypeScript, health endpoint, unit test
-infrastructure/
-  compose.yaml            общая инфраструктура и именованные тома
-  compose.dev.yaml        reload и bind mounts для разработки
-  compose.production.yaml основа отдельной production-конфигурации
-  docker/                 Dockerfiles
-  minio/                  idempotent bucket/account bootstrap
-  mlflow/                 Tracking server, зависимости, ручная smoke-проверка
-.github/workflows/ci.yml   lint, typecheck, unit tests, Docker build, Compose config
-docs/                     ТЗ, архитектура, задачи, эксплуатация
-AGENTS.md                 обязательные ограничения Codex
-.env.example              имена переменных и примеры без рабочих секретов
-```
+Medical AI New использует модульный монолит FastAPI. Next.js обращается к API через same-origin proxy. PostgreSQL хранит пользователей, диалоги, метаданные, версии извлечения и состояния задач. MinIO хранит оригиналы, Qdrant — индексы. Redis и Celery обслуживают фоновые задания. MLflow использует отдельную PostgreSQL и отдельный закрытый bucket.
 
-## Ручная проверка
+| Каталог | Содержимое |
+|---|---|
+| `backend/` | Python 3.12, FastAPI, SQLAlchemy, Alembic, Pydantic, Celery, тесты и Evaluation |
+| `frontend/` | Next.js App Router, TypeScript, Tailwind CSS и Vitest |
+| `infrastructure/` | Compose, Dockerfile, конфигурации хранилищ и MLflow |
+| `docs/` | ТЗ, архитектура, эксплуатация, аудит и порядок работы с GitHub |
+| `.github/` | CI и сканирование локальных файлов и Git-истории |
 
-Требуются Docker Desktop с Linux containers и Compose v2, Git Bash, Git.
-Для проверок вне Docker: Python 3.12 и Node.js 22. Команды предполагают
-стандартные порты из `.env.example`.
+[ТЗ](docs/TZ.md) · [Архитектура](docs/ARCHITECTURE.md) · [Эксплуатация](docs/OPERATIONS.md)
+
+## Локальный запуск
+
+Команды выполняет пользователь из корня проекта в Git Bash для Windows. Нужны Docker Desktop с Linux containers и Docker Compose v2. Если `.env` отсутствует, создайте его из шаблона и задайте независимые случайные значения вместо `CHANGE_ME`. Храните файл локально и передавайте его через `--env-file`. Порты приложений по умолчанию привязаны к loopback.
 
 ```bash
-cd /c/workplace/Medical_AI_New
 cp -n .env.example .env
-```
-
-Откройте `.env` в редакторе и замените все `CHANGE_ME` независимыми случайными
-значениями. Не загружайте `.env` командой `source`: это данные для Compose,
-а не shell-скрипт. Не коммитьте `.env`. При использовании `$` в значениях
-учитывайте интерполяцию Compose; для локальных секретов удобны случайные
-буквы и цифры. Порты UI привязаны к `127.0.0.1`.
-
-```bash
-# Функция действует только в текущем окне Git Bash.
+# Перед следующими командами заполните локальный .env в редакторе.
 dc() { docker compose --env-file .env -f infrastructure/compose.yaml -f infrastructure/compose.dev.yaml "$@"; }
 
-# Только валидация; --quiet не печатает разрешённые секреты.
 dc config --quiet
-docker compose --env-file .env -f infrastructure/compose.yaml -f infrastructure/compose.production.yaml config --quiet
-
-# Далее — установка/сборка и запуск, только вручную.
 dc build
+dc up -d --wait postgres
+# Только для локальной БД разработки.
+dc run --rm --no-deps backend python -m alembic upgrade head
 dc up -d --wait --wait-timeout 240
-dc ps -a
 curl --fail http://localhost:8000/health/live
 curl --fail http://localhost:3000/health/live
-curl --fail http://localhost:5000/health
+```
 
-# Проверки внутри dev-контейнеров, без локальной установки Python/Node.
+Откройте [приложение](http://localhost:3000) и [локальный MLflow](http://localhost:5000). Чат и RAG требуют локальных моделей и настроек из [руководства по чату](docs/STAGE5.md) и [Hybrid RAG](docs/HYBRID_RAG.md). Для остановки с сохранением томов используйте `dc down`. MinIO Server и Client собираются из release-артефактов с закреплёнными версиями и SHA‑256. [Операции с MinIO](docs/OPERATIONS.md#исправление-установки-minio-client)
+
+## Проверки
+
+```bash
 dc exec backend python -m ruff check .
-dc exec backend python -m ruff format --check .
 dc exec backend python -m mypy app
-dc exec backend python -m pytest
+dc exec backend python -m pytest -m 'not integration'
 dc exec frontend npm run lint
 dc exec frontend npm run typecheck
 dc exec frontend npm test
-
-# Отдельная ручная интеграционная проверка MLflow; создаёт синтетические записи.
-dc exec -e MLFLOW_TRACKING_URI=http://127.0.0.1:5000 mlflow python smoke.py
 ```
 
-Ожидается: все проверки завершаются с кодом 0, долгоживущие сервисы имеют
-статус `healthy`; `minio-init` завершён с кодом 0. Backend/frontend возвращают
-`{"status":"ok"}`, MLflow `/health` — HTTP 200. Smoke-проверка выводит `PASS`,
-имя эксперимента, run ID и номер синтетической версии в Registry. Она проверяет
-сохранение метрик/параметров и двустороннюю передачу артефакта через proxy.
-Проверочный артефакт — текст, он не является моделью для инференса.
+GitHub Actions выполняет эти проверки, сканирование истории и зависимостей, сборку runtime-образов и тесты миграций на временной PostgreSQL. Для интеграции документов CI использует отдельный синтетический Compose. Сценарии RAG, облачные бенчмарки и MLflow проверяются отдельно. [Первый push и CI](docs/GITHUB_SETUP.md) · [Evaluation 6.6](docs/STAGE6_6.md)
 
-UI: [приложение](http://localhost:3000), [MLflow](http://localhost:5000),
-[MinIO Console](http://localhost:9001). В MinIO входят root-данными из `.env`;
-MLflow работает отдельной учётной записью и имеет доступ только к своему bucket.
-В MLflow найдите `infrastructure-smoke-*`, сохраните run ID и имя Registry,
-откройте артефакт `probe.txt`.
+## Безопасность и работа с репозиторием
 
-```bash
-# Пересоздание контейнеров без удаления томов.
-dc up -d --force-recreate --wait --wait-timeout 240
-dc ps -a
-```
+Рабочие ключи, `.env`, медицинские документы, выгрузки, локальные отчёты и логи остаются вне Git. В репозитории хранятся синтетические фикстуры, методика Evaluation, проверенные агрегаты и техническая документация. Перед push выполните локальную проверку истории по [инструкции GitHub](docs/GITHUB_SETUP.md).
 
-После пересоздания найдите прежний эксперимент/run и Registry version в UI,
-снова скачайте прежний `probe.txt`. Новый запуск smoke создаст другие записи,
-поэтому сам по себе не проверяет сохранение прежних данных.
+API проверяет владельца документов и историю источников. Внешние вызовы требуют явного согласия. Для доступа за пределами локального стенда нужно отдельно подтвердить TLS, разграничение доступа, резервное восстановление, удаление данных и требования к обработке медицинской информации.
 
-```bash
-# Остановка без удаления данных.
-dc down
-```
-
-Не добавляйте `-v` к остановке. Полные инструкции, локальные проверки без Docker,
-подготовка lock-файлов и ограничения production: [OPERATIONS.md](docs/OPERATIONS.md).
-
-## Инициализация нового Git-репозитория (историческая инструкция)
-
-Для текущего проекта инициализация уже выполнена, повторять её не требуется.
-
-Git-репозиторий и remote агентом не создавались. После ручного просмотра файлов:
-
-```bash
-git init -b main
-git status --short
-git add .
-git diff --cached --stat
-# Проверьте, что .env и медицинские данные не попали в индекс.
-git commit -m "Initialize Medical AI stage 1 infrastructure"
-```
-
-Создание remote и push выполняет пользователь отдельно. Workflow запускается
-GitHub после push/PR либо вручную; автоматической публикации образов и CD нет.
-
-## Статус
-
-Этап 1 завершён по сообщению пользователя. В текущей сверке Codex выполнял
-только чтение и статический просмотр, без сборок, миграций и тестов. Прямые зависимости
-и теги образов зафиксированы; транзитивные lock-файлы и image digests ещё
-не подготовлены. Совместимость и безопасность зависимостей нужно подтвердить
-до production. Следующий этап — после проверки и явного подтверждения пользователем.
+Правила для Codex находятся в [AGENTS.md](AGENTS.md). История решений и план этапов сохранены в [CODEX_TASKS.md](docs/CODEX_TASKS.md).

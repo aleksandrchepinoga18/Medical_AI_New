@@ -25,6 +25,7 @@ from app.chat.document_context import (
 from app.chat.evidence import MISSING, EvidenceHit, needs_documents
 from app.chat.medical_sources import (
     knowledge_hit,
+    medical_reference_query,
     public_citation_key,
     publication_hit,
     pubmed_query,
@@ -291,7 +292,7 @@ def execute_tool(
                           public_hits=[publication_hit(entry) for entry in entries])
     assert isinstance(args, (ListDocuments, SearchDocuments, AnalyzeMeasurements))
     selected = list(dict.fromkeys(args.documents))
-    extractions = []
+    extractions: list[Extraction] = []
     if selected:
         extractions, notice = resolve_documents(db, user_id, tuple(selected))
         if notice:
@@ -395,7 +396,7 @@ class AgentEvidence:
         })
 
     def public_fragments(self, budget: int) -> list[dict[str, Any]]:
-        fragments = []
+        fragments: list[dict[str, str | int | bool | list[str] | None]] = []
         first: dict[str, str] = {}
         for key, hit in self.public_hits.items():
             first.setdefault(hit["kind"], key)
@@ -505,6 +506,7 @@ async def run_agent(
     *, requested: tuple[int, ...], generation: UUID, question: str = "",
 ) -> list[str]:
     pubmed_requested = requests_pubmed(question)
+    reference_query = None if requested or pubmed_requested else medical_reference_query(question)
     tools = tool_definitions(include_pubmed=pubmed_requested)
     answer_room = room
     definitions = len(encode(tools).encode())
@@ -517,6 +519,22 @@ async def run_agent(
     calls_left = MAX_CALLS
     attempted_data_lookup = False
     obtained_data = False
+    knowledge_attempted = False
+
+    def execute(call: ToolCall, budget: int) -> ToolResult:
+        with Session(engine) as db:
+            return execute_tool(db, user_id, settings, call, budget, requested, question)
+
+    def log_tool(call: ToolCall, result: ToolResult, error: str | None) -> None:
+        logger.info(
+            "chat_agent_tool generation=%s tool=%s status=%s code=%s "
+            "documents=%d measurements=%d sources=%d",
+            generation, call.name if call.name in TOOLS else "unknown",
+            "error" if error else result.status, error or "-",
+            result.document_count, sum("measurement" in hit for hit in result.hits),
+            len({hit["source_url"] for hit in [*result.catalog, *result.hits]})
+            + len(result.public_hits),
+        )
 
     def available_for_result(context: list[ToolRound], reply: dict[str, Any]) -> int:
         remaining = room - message_bytes([*tool_messages(context), reply])
@@ -597,6 +615,20 @@ async def run_agent(
         finally:
             generation_log_id.reset(log_context)
         if not calls:
+            if reference_query:
+                if not knowledge_attempted:
+                    if calls_left == 0:
+                        evidence.notices["context"] = (
+                            "Достигнут лимит вызовов для проверки источников."
+                        )
+                        return []
+                    call = ToolCall("search_medical_knowledge", {"query": reference_query})
+                    result = await to_thread.run_sync(
+                        execute, call, settings.generation_tool_chars, abandon_on_cancel=True,
+                    )
+                    evidence.render_public(call.name, result)
+                    log_tool(call, result, result.data.get("error"))
+                return await finish([])
             if evidence.public_attempted:
                 return await finish(parts or ["Доступных сведений недостаточно."])
             if not "".join(parts).strip():
@@ -637,14 +669,14 @@ async def run_agent(
             if expanded < len(too_large.encode()):
                 raise GatewayError("agent_context_limit")
 
-            def execute(current: ToolCall = call, limit: int = expanded) -> ToolResult:
-                with Session(engine) as db:
-                    return execute_tool(db, user_id, settings, current, limit, requested, question)
-
             result = (
                 ToolResult({"error": "repeated_tool"})
-                if repeated else await to_thread.run_sync(execute, abandon_on_cancel=True)
+                if repeated else await to_thread.run_sync(
+                    execute, call, expanded, abandon_on_cancel=True,
+                )
             )
+            if call.name == "search_medical_knowledge" and not repeated:
+                knowledge_attempted |= result.data.get("error") != "invalid_arguments"
             content = (
                 evidence.render_public(call.name, result, pubmed_requested=pubmed_requested)
                 if call.name in PUBLIC_TOOLS
@@ -667,15 +699,7 @@ async def run_agent(
                 has_result = error is None and result.status != "empty"
                 obtained_data |= has_result
                 step.has_document_result |= has_result
-            logger.info(
-                "chat_agent_tool generation=%s tool=%s status=%s code=%s "
-                "documents=%d measurements=%d sources=%d",
-                generation, call.name if call.name in TOOLS else "unknown",
-                "error" if error else result.status, error or "-",
-                result.document_count, sum("measurement" in hit for hit in result.hits),
-                len({hit["source_url"] for hit in [*result.catalog, *result.hits]})
-                + len(result.public_hits),
-            )
+            log_tool(call, result, error)
             step.messages.append({**reply, "content": content})
         rounds.append(step)
     if evidence.public_attempted:
