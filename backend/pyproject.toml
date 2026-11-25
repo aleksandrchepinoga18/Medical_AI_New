@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools==80.9.0"]
+requires = ["setuptools==84.1.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -21,14 +21,14 @@ dependencies = [
   "email-validator==2.3.0",
   "minio==7.2.18",
   "python-multipart==0.0.31",
-  "pymupdf==1.26.6",
+  "pymupdf==1.26.7",
   "python-docx==1.2.0",
 ]
 
 [project.optional-dependencies]
 dev = [
   "mypy==1.18.2",
-  "pytest==8.4.2",
+  "pytest==9.0.3",
   "ruff==0.14.4",
 ]
 
