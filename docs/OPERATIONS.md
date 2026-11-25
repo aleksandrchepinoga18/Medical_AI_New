@@ -232,7 +232,7 @@ python -m pip install './backend[dev]'
 )
 (
   cd frontend
-  npm install
+  npm ci
   npm run lint
   npm run typecheck
   npm test
@@ -240,11 +240,10 @@ python -m pip install './backend[dev]'
 )
 ```
 
-`npm install` создаёт настоящий `frontend/package-lock.json`. Сохраните его
-в Git после проверки; CI и Dockerfile автоматически переходят на `npm ci`
-при наличии lockfile. Проверка зависимостей, например `npm audit`, требует
-отдельного просмотра результата пользователем; отсутствие найденных проблем
-не заменяет security-приёмку.
+После изменения `frontend/package.json` обновите `frontend/package-lock.json`
+командой `npm install --package-lock-only --ignore-scripts` из каталога
+`frontend`. Проверьте результат через `npm ci` и `npm audit` и сохраните оба
+файла в Git. CI и Dockerfile устанавливают зависимости из lock-файла.
 
 Python direct dependencies закреплены в `backend/pyproject.toml` и
 `infrastructure/mlflow/requirements.txt`. Полные транзитивные lock-файлы пока
